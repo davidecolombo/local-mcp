@@ -1,0 +1,108 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Logs
+*.log
+logs/
+
+# Test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# Jupyter notebooks
+.ipynb_checkpoints
+
+# IDE / editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+*.env
+
+# Claude Code / AI artifacts
+.claude/
+.claude-cache/
+.ai/
+.prompts/
+.prompt_cache/
+
+# Local models (e.g., Ollama)
+models/
+*.gguf
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Local databases
+*.db
+*.sqlite3
+
+# Type checking caches (mypy)
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Linter caches (ruff)
+.ruff_cache/
+
+# Pyre type checker
+.pyre/
+
+# Pytype cache
+.pytype/
+
+# Generic caches
+.cache/
+
+# Backup / swap files
+*~
+*.bak
+*.swp
