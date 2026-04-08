@@ -107,6 +107,7 @@ For each `<delete/>` block:
 1. **Strict allowlist**: the deleted path must exactly match (Windows-normalized) one of the absolute paths passed in `files`. The model cannot delete paths it wasn't given.
 2. **Must exist as a regular file**.
 3. **No conflict**: the same path must not also appear in a `<file>` block.
+4. **Explicit delete intent**: the instruction must contain a whole-file deletion phrase (e.g. `delete the file`, `remove the file`, `rimuovi il file`, `elimina il file`, `cancella il file`). Otherwise the `<delete/>` block is rejected, even if the path is in the allowlist. This prevents the model from confusing "remove method X" with "delete the whole file".
 
 If any guard fails on any change, **the entire batch is rejected** and a structured diagnostic is returned. No partial writes ever.
 

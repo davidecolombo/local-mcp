@@ -77,6 +77,17 @@ REMOVAL_KEYWORDS = (
     "cancella", "rimuovi", "elimina", "svuota", "togli",
 )
 
+# Stricter than REMOVAL_KEYWORDS: these phrases clearly signal WHOLE-FILE
+# deletion, not in-file code removal. Used by the delete-intent guard to
+# veto <delete/> blocks when the instruction doesn't clearly ask for one.
+WHOLE_FILE_DELETE_PHRASES = (
+    "delete the file", "delete file", "delete this file", "delete these files",
+    "remove the file", "remove file", "remove this file", "remove these files",
+    "rimuovi il file", "rimuovi file", "rimuovi questo file",
+    "elimina il file", "elimina file", "elimina questo file",
+    "cancella il file", "cancella file", "cancella questo file",
+)
+
 # Lazy-output markers — matched as WHOLE TRIMMED LINES, and only flagged when
 # the same line was NOT already present in the original file. Whole-line +
 # delta-against-original keeps false positives near zero.
@@ -147,6 +158,36 @@ Instruction: delete this file
 
 OUTPUT:
 <delete path="/project/scripts/old_script.py"/>
+
+Example C — remove a method from a file (NOT a file deletion):
+
+INPUT:
+<file path="/project/src/Util.java">
+public class Util {
+    public static int a() { return 1; }
+    public static int b() { return 2; }
+}
+</file>
+Instruction: remove the unused method b
+
+OUTPUT:
+<file path="/project/src/Util.java">
+public class Util {
+    public static int a() { return 1; }
+}
+</file>
+
+CRITICAL — <delete/> is for WHOLE-FILE deletion ONLY:
+- Emit <delete path="..."/> ONLY when the instruction explicitly asks to
+  delete the entire file (e.g. "delete the file X", "delete file Foo.java",
+  "rimuovi il file Bar.py", "elimina old_script.py", "cancella il file Y").
+- For every other removal request — remove a method, remove a field,
+  remove a class, remove unused imports, remove a block, strip comments —
+  you MUST output a <file> block containing the edited content with the
+  target portion excised. Do NOT emit <delete/>.
+- When the instruction is ambiguous, prefer <file>. A <delete/> that was
+  not explicitly asked for is the worst possible outcome and will be
+  rejected by the server.
 
 Rules:
 - Output ONLY <file> and <delete/> blocks. No explanations, no markdown fences,
@@ -237,14 +278,14 @@ def _infer_single_file_delete(
     bare <delete/> with no path attribute, or <file>PATH</file><delete/>) for a
     single-file input. Safe because it requires ALL of:
       - exactly one file in the input,
-      - a removal keyword in the instruction,
+      - an EXPLICIT whole-file deletion phrase in the instruction,
       - some form of <delete> tag in the raw output.
-    Without all three, returns []. The removal keyword in the instruction is
-    the safety net: it ensures the user explicitly asked for a deletion.
+    Without all three, returns []. The strict phrase check ensures the user
+    clearly asked for file-level deletion, not in-file code removal.
     """
     if len(files) != 1:
         return []
-    if not _instruction_allows_shrink(instruction):
+    if not _instruction_requests_whole_file_delete(instruction):
         return []
     if not _LOOSE_DELETE_RE.search(raw):
         return []
@@ -308,6 +349,17 @@ def _atomic_write(target: Path, content: bytes) -> None:
 def _instruction_allows_shrink(instruction: str) -> bool:
     low = instruction.lower()
     return any(kw in low for kw in REMOVAL_KEYWORDS)
+
+
+def _instruction_requests_whole_file_delete(instruction: str) -> bool:
+    """
+    Stricter than _instruction_allows_shrink: returns True only if the
+    instruction explicitly asks to delete a WHOLE FILE (not just remove some
+    code from inside it). Used by the delete-intent guard to veto <delete/>
+    blocks unless the user clearly asked for file-level deletion.
+    """
+    low = instruction.lower()
+    return any(phrase in low for phrase in WHOLE_FILE_DELETE_PHRASES)
 
 
 def _check_non_empty(content: str) -> str | None:
@@ -525,6 +577,21 @@ def local_edit(
         ):
             if check:
                 failures.append(f"{path}: {check}")
+
+    # 9b. Delete intent guard: <delete/> must be explicitly requested.
+    #     Prevents the model from hallucinating a file deletion when the user
+    #     only wanted to remove a method/field/block inside the file.
+    if deletes and not _instruction_requests_whole_file_delete(instruction):
+        return (
+            f"[{chosen}] REJECTED — model emitted <delete/> for:\n"
+            + "\n".join(f"  • {p}" for p in deletes)
+            + "\nBut the instruction does not contain an explicit whole-file "
+              "deletion phrase (e.g. 'delete the file', 'rimuovi il file'). "
+              "If you wanted code removed in-place, rephrase without the word "
+              "'file' (e.g. 'remove method foo'). If you really want the whole "
+              "file gone, include 'delete the file <path>'. "
+              "No files were modified."
+        )
 
     if failures:
         return (
