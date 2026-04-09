@@ -7,7 +7,12 @@ MCP server that delegates implementation work to local Ollama models so Claude (
 The big savings come from **never round-tripping file contents through Claude's context**:
 
 - `local_edit` and `local_write` read and write files on the MCP side. Claude sends a short instruction and gets back a one-line summary. **These are the tools that save the most tokens; prefer them whenever a result will land in a file.**
+- `local_delete` and `local_rename` are pure filesystem operations — no model call at all. They exist so the caller never has to ask the model to decide *whether* to delete or move a file; the caller already knows.
 - `local_snippet` returns generated text that flows back through Claude. It's useful as a fallback for regex / SQL / one-liners that have no file destination yet, but every byte of its output costs Claude input tokens. Use sparingly.
+
+### Language normalization
+
+All instruction strings (`local_edit`, `local_write`, `local_snippet`) are checked for non-English content on the server side and translated to English in a tiny pre-pass before they reach the main model and the guard-rails. This means callers can write instructions in Italian, French, Spanish, German, etc. without losing any safety check — the guard-rails only need to reason about English keywords (`delete`, `remove`, `strip`, …) and the model also produces better edits when prompted in English. English instructions skip the pre-pass entirely (zero overhead).
 
 ## Models: single-model architecture
 
@@ -15,7 +20,7 @@ The big savings come from **never round-tripping file contents through Claude's 
 |----------------------|-------------------------------|---------|
 | `qwen3-coder:30b`    | MoE 30B (3B active per token) | Everything: multi-file edits, scaffolding, snippets |
 
-All three tools (`local_edit`, `local_write`, `local_snippet`) call **the same model**. There is no routing, no small/large tier, no model switching. The `model` parameter on each tool is preserved for backward compatibility but is currently ignored.
+All three Ollama-backed tools (`local_edit`, `local_write`, `local_snippet`) call **the same model**. There is no routing, no small/large tier, no model switching. There is no `model` parameter on any tool — the model is server configuration, not a caller concern.
 
 ### Why a single model
 
@@ -58,36 +63,51 @@ claude mcp add --scope user local-mcp uv run "C:/Users/user/.claude/local-mcp/se
 
 ## Tools exposed to Claude Code
 
-### `local_edit(files, instruction, model?)`
+### `local_edit(files, instruction)`
 
-Edit one or more **existing** files in place. Reads the files, sends them to `qwen3-coder:30b`, parses `<file>` and `<delete/>` blocks from the response, validates with guard-rails, and atomically applies the result. Claude only sees a one-line summary or a structured rejection.
+Edit one or more **existing** files in place. Reads the files, sends them to `qwen3-coder:30b`, parses `<file>` blocks from the response, validates with guard-rails, and atomically applies the result. Claude only sees a one-line summary or a structured rejection.
 
 ```
 files:       list of absolute file paths
-instruction: what to change (plain English; include "delete"/"remove"/"rimuovi"
-             if you expect a large reduction in size)
-model:       ignored (kept for backward compatibility)
+instruction: what to change (any language; include "delete"/"remove"/"strip"
+             — or the equivalent in your language — if you expect a large
+             reduction in size, otherwise the shrink guard will reject)
 ```
 
-The model can also emit `<delete path="..."/>` blocks to **remove a file entirely** instead of leaving it as an empty stub. Deletes are restricted to paths in the `files` argument; the model cannot invent new paths to delete.
+`local_edit` **never deletes or renames files**. For deletion call `local_delete`; for rename/move call `local_rename`. The model is forbidden from emitting any tag other than `<file>`, and the parser only recognizes `<file>` blocks.
 
-### `local_write(path, instruction, model?)`
+### `local_write(path, instruction)`
 
 Create a **new** file from scratch entirely on the local side. Refuses to overwrite an existing file (use `local_edit` for that). The generated content never enters Claude's context.
 
 ```
 path:        absolute path of the file to create
-instruction: what to put in the file (plain English; can be detailed)
-model:       ignored (kept for backward compatibility)
+instruction: what to put in the file (any language; can be detailed)
 ```
 
-### `local_snippet(prompt, model?)`
+### `local_delete(paths)`
+
+Delete one or more files. **No model call** — pure `os.unlink`. All paths are validated up front (must be absolute, must exist, must be regular files); if any validation fails, no file is touched. If a deletion fails midway through the loop (e.g. file is locked), already-deleted files are NOT restored — the report tells you which ones survived.
+
+```
+paths: non-empty list of absolute file paths
+```
+
+### `local_rename(src, dst)`
+
+Rename or move a file. **No model call** — pure `os.replace`. Refuses to overwrite an existing destination. Creates the destination parent directory if missing. Atomic within a Windows volume; cross-volume moves fall back to copy+delete and are not atomic.
+
+```
+src: absolute path of the file to rename (must exist, regular file)
+dst: absolute destination path (must NOT exist)
+```
+
+### `local_snippet(prompt)`
 
 Generate a short snippet and return it as text. **This costs Claude tokens** because the result flows back into Claude's context. Use only when there's no file destination (regex, SQL, one-liners). Uses a 4k context window and a 1024-token output cap to keep snippet calls fast and prevent the model from rambling in markdown; a terse system prompt steers it toward "code only, no prose."
 
 ```
-prompt: the task or question
-model:  ignored (kept for backward compatibility)
+prompt: the task or question (any language)
 ```
 
 ## Guard-rails
@@ -96,31 +116,32 @@ The old setup occasionally wrote empty / partially-truncated files, or hollowed 
 
 For each `<file>` block emitted by the model:
 
-1. **Non-empty**: empty or whitespace-only content is rejected (the model should have used `<delete/>`).
+1. **Non-empty**: empty or whitespace-only content is rejected (use `local_delete` to remove a file).
 2. **No truncation markers**: lines whose entire trimmed content matches a lazy-output marker (`... rest of file unchanged`, `// ... existing code ...`, `<TRUNCATED>`, etc.) are rejected, but **only if the same line wasn't already in the original**. So legitimate template files don't trip the check.
-3. **No suspicious shrink**: if the new file is less than 50% of the original size AND the instruction contains no removal keyword (`delete`, `remove`, `strip`, `cancella`, `rimuovi`, `elimina`, …), the edit is rejected.
+3. **No suspicious shrink**: if the new file is less than 50% of the original size AND the (English-normalized) instruction contains no removal keyword (`delete`, `remove`, `strip`, `drop`, `clear`, `empty`, `shrink`, `erase`, `purge`, `discard`), the edit is rejected. Non-English instructions are translated first, so equivalents in other languages also satisfy this guard.
 4. **Bracket delta unchanged**: for `.py .java .js .ts .tsx .jsx .go .rs .c .cpp .h .hpp .json`, the unmatched-bracket count `({}, (), [])` of the new file must match the original's. Comparing the *delta* lets strings/comments cancel symmetrically and avoids false positives. Catches mid-stream truncation cheaply.
-5. **Identity no-op**: files where the model returned the original verbatim are silently dropped from the batch.
-
-For each `<delete/>` block:
-
-1. **Strict allowlist**: the deleted path must exactly match (Windows-normalized) one of the absolute paths passed in `files`. The model cannot delete paths it wasn't given.
-2. **Must exist as a regular file**.
-3. **No conflict**: the same path must not also appear in a `<file>` block.
-4. **Explicit delete intent**: the instruction must contain a whole-file deletion phrase (e.g. `delete the file`, `remove the file`, `rimuovi il file`, `elimina il file`, `cancella il file`). Otherwise the `<delete/>` block is rejected, even if the path is in the allowlist. This prevents the model from confusing "remove method X" with "delete the whole file".
+5. **Semantic parse** (`.py`, `.json` only): the new content is fed to `ast.parse` / `json.loads`. Syntax errors are rejected with the offending line number. This is a real parser — it catches unterminated strings, stray indentation, missing commas, and other truncation patterns the bracket heuristic cannot see. For other extensions the check is a no-op (adding JS/TS would require shelling out to `node --check`).
+6. **Identity no-op**: files where the model returned the original verbatim are silently dropped from the batch.
+7. **Path allowlist**: the model can only emit `<file>` blocks for paths that were passed in `files`. Any unknown path rejects the entire batch.
 
 If any guard fails on any change, **the entire batch is rejected** and a structured diagnostic is returned. No partial writes ever.
 
+Note: there is no `<delete/>` guard-rail because there is no `<delete/>` block. Deletion goes through the dedicated `local_delete` tool, where the caller — not the model — names the paths to remove. This eliminates an entire class of failure modes (hallucinated deletes, intent guards that depended on language-specific phrase lists, the inference fallback for malformed delete tags).
+
 `local_write` runs the same checks except: no shrink guard (no original to compare), and the bracket check is absolute (`{}=0 ()=0 []=0`) instead of delta.
+
+### Parse-failure retry
+
+If the model returns output that contains no `<file>` block (and no fenced-markdown fallback either), the server **automatically retries once** with a stricter user message (`"Your previous output was MALFORMED..."`) before surfacing an error. This protects Claude's context from seeing the first malformed dump at all. If the retry also fails, the raw output echoed in the error is capped at ~600 chars so a rambling model response can't blow up the context.
 
 ### Atomic apply
 
-All changes are validated first; only then are they applied. Each file is written via a temp file in the same directory + `os.replace` (atomic on Windows). If any write or delete fails partway through (e.g., a file is locked by an IDE or antivirus), every successful write is reverted from the captured original bytes.
+All `local_edit` changes are validated first; only then are they applied. Each file is written via a temp file in the same directory + `os.replace` (atomic on Windows). If any write fails partway through (e.g., a file is locked by an IDE or antivirus), every successful write is reverted from the captured original bytes. `local_delete` is intentionally non-atomic across multiple files: deletions are reported individually and survivors are not restored.
 
 ### Windows-specific notes
 
 - **Line endings preserved**: the dominant line ending of each original file (CRLF or LF) is detected and re-applied on write. The model always sees and emits LF; the server is the only place that handles CRLF. No silent CRLF↔LF conversion.
-- **Path normalization**: `<delete>` paths are matched case-insensitively and slash-agnostically (`os.path.normcase(os.path.abspath(...))`), so `C:/Users/...`, `C:\Users\...`, and `c:\users\...` all resolve to the same allowlist entry.
+- **Path normalization**: paths in `local_edit`'s allowlist are matched case-insensitively and slash-agnostically (`os.path.normcase(os.path.abspath(...))`), so `C:/Users/...`, `C:\Users\...`, and `c:\users\...` all resolve to the same entry. `local_delete` and `local_rename` use the same normalization for self-comparison.
 - **Locked files**: a `PermissionError` from an editor/AV/indexer holding the file is caught, the batch is reverted, and Claude gets a `file is locked or not writable` diagnostic. No traceback.
 - **Long paths**: paths exceeding the Windows 260-char limit will surface as a guard-rail rejection. No `\\?\` workaround; enable Windows long-path support if needed.
 
@@ -240,15 +261,18 @@ After 5+ minutes of idle, run `ollama ps` again. With `keep_alive: -1`, the `UNT
 ### 4. Guard-rail regression tests (these are the failures from the deepseek era)
 
 - **Method removal**: ask `local_edit` to "remove unused method foo" on a small file → confirm the method is removed and the rest of the file is still intact (not truncated).
-- **File deletion via `<delete/>`**: ask `local_edit` to "delete the file Bar.java" → confirm the model emits `<delete/>`, the file is removed, and is **not** left as an empty class stub.
+- **File deletion**: call `local_delete([path])` directly → confirm the file is removed and no LLM call is made (check `ollama ps` token counter is unchanged). `local_edit` itself can no longer delete files; if the model emits any non-`<file>` tag it is silently ignored.
+- **File rename**: call `local_rename(src, dst)` → confirm `src` is gone, `dst` exists with the same bytes, and again no LLM call. Then call it again with the same args → expect a clean `dst already exists` error.
+- **Non-English instruction**: call `local_edit` with `instruction="rimuovi il metodo foo"` (Italian) or `"supprime la méthode foo"` (French) → confirm the edit succeeds and the shrink guard does NOT reject (the translation pre-pass converts the removal verb to English before the guard runs).
 - **Suspicious shrink rejection**: pass a non-trivial file with a vague instruction that causes the model to return near-empty content → confirm the shrink guard rejects and **no file on disk is touched**.
 - **Atomic apply**: pass two files where one valid edit and one invalid edit are returned → confirm neither file is modified (all-or-nothing).
+- **Semantic parse guard**: ask `local_edit` to make a change on a `.py` file with an instruction that's likely to produce a syntax error (e.g. "delete the `def` keyword from function foo") → confirm rejection with a `python syntax error at line N` diagnostic and no file touched. Same on a `.json` file.
 
 ### 5. Windows-specific tests
 
 - **CRLF preservation**: edit a file that uses CRLF line endings → confirm the file still uses CRLF after the edit (no silent conversion to LF, no mixed endings). Check with `python -c "print(repr(open('path','rb').read()[:200]))"`.
 - **Locked file**: open a target file in another process holding an exclusive lock → run `local_edit` on it → confirm a clean `file is locked or not writable` rejection (no traceback, no partial state).
-- **Path normalization**: call `local_edit` with `files=["C:/Users/.../Foo.java"]` and an instruction the model is likely to satisfy with a `<delete>` block; verify the delete succeeds even if the model emits the path with backslashes or different casing (`C:\Users\...\Foo.java` / `c:\users\...\foo.java`).
+- **Path normalization**: call `local_delete` with a path mixing forward and backslashes / different casing (`C:/Users/.../Foo.java`, `C:\Users\...\Foo.java`, `c:\users\...\foo.java`) and verify all three resolve to the same file. For `local_edit`, pass a path with one casing in `files` and verify it accepts the model's edit even if the response echoes a different casing (the allowlist is case-insensitive).
 
 ### 6. Token-spend sanity check
 
