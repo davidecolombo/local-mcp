@@ -46,34 +46,54 @@ $ClaudeMdBlock = @"
 $BeginMarker
 ## Use of the local-mcp server
 
-For code file modifications, ALWAYS use the tools from the ``local-mcp`` server:
-- ``local_edit`` instead of ``Edit`` (existing files)
-- ``local_write`` instead of ``Write`` (new files)
+For file operations, ALWAYS use the tools from the ``local-mcp`` server:
+- ``local_edit`` instead of ``Edit`` (modifying existing files in place)
+- ``local_write`` instead of ``Write`` (creating new files)
+- ``local_delete`` instead of ``Bash rm`` (deleting files; no model call)
+- ``local_rename`` instead of ``Bash mv`` (rename / move; no model call, atomic within a volume)
 - ``local_snippet`` only as a fallback for snippets with no file destination
 
-Reason: token savings -- file contents never pass through Claude's context.
-The built-in ``Edit`` and ``Write`` tools are denied via ``.claude/settings.json`` to enforce this workflow.
+Reason: token savings -- for ``local_edit`` / ``local_write`` the file
+contents never pass through Claude's context, and ``local_delete`` /
+``local_rename`` are pure syscalls that cost nothing beyond the tool
+invocation itself. The built-in ``Edit`` and ``Write`` tools are denied via
+``.claude/settings.json`` to enforce this workflow.
 
-### Trust local_edit, do not re-read files to verify
+### Instructions can be in any language
 
-``local_edit`` is transactional: guard-rails run server-side, writes are
-atomic, and on failure all successful writes are reverted from captured
-original bytes. When the summary begins with ``[qwen3-coder:30b]`` and lists
-modified/deleted files, trust it and move on. Do NOT ``Read`` the file
-afterwards to "verify"; that re-ingests the content into Claude's context
-and defeats the token-saving goal. Read a file ONLY when:
-- ``local_edit`` returned a line starting with ``REJECTED`` or ``Error``, or
+The instruction strings to ``local_edit``, ``local_write``, and
+``local_snippet`` may be written in any language (Italian, French, Spanish,
+German, etc.). Non-English instructions are detected and translated to
+English server-side before they reach the model and the guard-rails. Do NOT
+translate instructions yourself before calling these tools -- it wastes
+output tokens for no benefit.
+
+### Trust the tools, do not re-read files to verify
+
+All ``local-mcp`` tools are transactional and report success or a structured
+error in their return value. ``local_edit`` runs guard-rails server-side,
+writes atomically, and reverts every successful write from captured original
+bytes if any write in the batch fails. ``local_delete`` validates every path
+up front before touching anything. ``local_rename`` is a single atomic
+``os.replace`` within a volume.
+
+When the summary begins with ``[qwen3-coder:30b]`` (for ``local_edit`` /
+``local_write``) or starts with ``Deleted`` / ``Renamed`` (for
+``local_delete`` / ``local_rename``) and lists the affected files, trust it
+and move on. Do NOT ``Read``, ``Glob``, or ``Bash ls`` the filesystem
+afterwards to "verify"; that defeats the token-saving goal. Read a file
+ONLY when:
+- the tool returned a line starting with ``REJECTED``, ``Error``, or ``Partial failure``, or
 - you genuinely need the current contents for a subsequent, unrelated step.
 
-### Phrasing for removals
+### Deleting and renaming files
 
-``local_edit`` distinguishes in-file code removal from whole-file deletion:
-- To remove a method / class / field / block inside a file, phrase it
-  *without* the word "file". Examples: "remove method foo", "strip unused
-  imports", "delete the password field".
-- To delete an entire file, phrase it *with* the word "file". Examples:
-  "delete the file Foo.java", "rimuovi il file Bar.py". The server will
-  refuse a ``<delete/>`` block if this exact pattern is missing.
+``local_edit`` never deletes or renames files -- it can only modify content
+in place. For whole-file deletion call ``local_delete([path, ...])``; for
+rename or move call ``local_rename(src, dst)``. Both are pure syscalls
+(no LLM involvement) and are strictly more reliable than asking a model to
+emit a delete tag. Do NOT use ``Bash`` with ``rm`` / ``mv`` / ``del`` /
+``move`` for file operations -- those bypass the MCP layer entirely.
 $EndMarker
 "@
 
