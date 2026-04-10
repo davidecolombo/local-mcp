@@ -58,29 +58,55 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("local-mcp")
 
 # ---------------------------------------------------------------------------
-# Model — single-model architecture, see iteration 2 in plans/.
+# Model configuration — loaded from model-config.json (optional).
+# See configs/ for ready-to-use templates.
 # ---------------------------------------------------------------------------
-MODEL = "qwen3-coder:30b"
-OLLAMA_URL = "http://localhost:11434/api/chat"
+_CONFIG_DEFAULTS: dict = {
+    "model": "qwen3-coder:30b",
+    "ollama_url": "http://localhost:11434/api/chat",
+    "edit_ctx": 32768,
+    "snippet_ctx": 4096,
+    "snippet_num_predict": 1024,
+    "translate_ctx": 2048,
+    "translate_num_predict": 512,
+    "timeout": 1200,
+}
 
-# Edit/write context window. 32k is plenty for multi-file edits and keeps the
-# KV-cache VRAM footprint manageable on 16 GB GPUs (the 30b weights already
-# use most of it).
-EDIT_CTX = 32768
 
-# Snippet tool uses a much smaller context (no files in the prompt) and a hard
-# cap on generated tokens to prevent qwen3 from rambling in markdown.
-SNIPPET_CTX = 4096
-SNIPPET_NUM_PREDICT = 1024
+def _load_model_config() -> dict:
+    """Load model-config.json from the same directory as server.py.
 
-# Translation pre-pass: tiny context, short output. Used only when the input
-# instruction is detected as non-English.
-TRANSLATE_CTX = 2048
-TRANSLATE_NUM_PREDICT = 512
+    Missing file or missing keys fall back to _CONFIG_DEFAULTS.
+    """
+    config_path = Path(__file__).resolve().parent / "model-config.json"
+    cfg = dict(_CONFIG_DEFAULTS)
+    if config_path.is_file():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                user_cfg = json.load(f)
+            if isinstance(user_cfg, dict):
+                for key in _CONFIG_DEFAULTS:
+                    if key in user_cfg:
+                        cfg[key] = user_cfg[key]
+        except (json.JSONDecodeError, OSError):
+            pass  # Malformed or unreadable — use defaults silently
+    return cfg
 
-# httpx timeout in seconds. qwen3-coder:30b on a multi-file edit with partial
-# CPU offload can take many minutes under load.
-TIMEOUT = 1200
+
+_cfg = _load_model_config()
+
+MODEL: str               = _cfg["model"]
+OLLAMA_URL: str           = _cfg["ollama_url"]
+EDIT_CTX: int             = _cfg["edit_ctx"]
+SNIPPET_CTX: int          = _cfg["snippet_ctx"]
+SNIPPET_NUM_PREDICT: int  = _cfg["snippet_num_predict"]
+TRANSLATE_CTX: int        = _cfg["translate_ctx"]
+TRANSLATE_NUM_PREDICT: int = _cfg["translate_num_predict"]
+TIMEOUT: int              = _cfg["timeout"]
+
+# Qwen3-specific: /no_think suppresses the reasoning chain, and a defensive
+# stripper catches any <think> tags that leak through.
+_IS_QWEN3: bool = "qwen3" in MODEL.lower()
 
 # ---------------------------------------------------------------------------
 # Guard-rail constants (tune freely)
@@ -155,8 +181,15 @@ def _call_ollama(
 
 
 def _strip_think_tags(text: str) -> str:
-    """Defensive: strip <think>...</think> if a qwen3 model emits any despite /no_think."""
+    """Strip <think>...</think> if a qwen3 model emits any. No-op for other models."""
+    if not _IS_QWEN3:
+        return text
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _maybe_no_think(prompt: str) -> str:
+    """Append /no_think only for Qwen3 models that support it."""
+    return f"{prompt}\n\n/no_think" if _IS_QWEN3 else prompt
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +261,7 @@ def _normalize_instruction(instruction: str) -> str:
                 "Translate the following instruction to English. Output ONLY "
                 "the translation as plain text — no preamble, no quotes, no "
                 "explanation, no markdown.\n\n"
-                f"{instruction}\n\n/no_think"
+                f"{_maybe_no_think(instruction)}"
             )}],
             num_ctx=TRANSLATE_CTX,
             num_predict=TRANSLATE_NUM_PREDICT,
@@ -244,57 +277,57 @@ def _normalize_instruction(instruction: str) -> str:
 # ---------------------------------------------------------------------------
 EDIT_SYSTEM = """\
 You are a code editing assistant. Output ONLY the complete new content of each
-modified file using <file> blocks. Output no other tag, no prose, no markdown.
+modified file using «file» blocks. Output no other tag, no prose, no markdown.
 
 Format for modifying or creating a file:
 
-<file path="/absolute/path/to/file">
+«file path="/absolute/path/to/file"»
 [complete file content — never truncate, never use placeholders]
-</file>
+«/file»
 
 Example A — modify Foo.java to add a field:
 
 INPUT:
-<file path="/project/src/Foo.java">
+«file path="/project/src/Foo.java"»
 public record Foo(String name) {}
-</file>
+«/file»
 Instruction: add an int age field to Foo
 
 OUTPUT:
-<file path="/project/src/Foo.java">
+«file path="/project/src/Foo.java"»
 public record Foo(String name, int age) {}
-</file>
+«/file»
 
 Example B — remove a method from a file (the whole file is rewritten without
 the method; the file itself stays):
 
 INPUT:
-<file path="/project/src/Util.java">
+«file path="/project/src/Util.java"»
 public class Util {
     public static int a() { return 1; }
     public static int b() { return 2; }
 }
-</file>
+«/file»
 Instruction: remove the unused method b
 
 OUTPUT:
-<file path="/project/src/Util.java">
+«file path="/project/src/Util.java"»
 public class Util {
     public static int a() { return 1; }
 }
-</file>
+«/file»
 
 Rules:
-- Output ONLY <file> blocks. No explanations, no markdown fences, no preamble,
+- Output ONLY «file» blocks. No explanations, no markdown fences, no preamble,
   no commentary, no other tags.
-- <file> blocks must contain the COMPLETE file content. Never write
+- «file» blocks must contain the COMPLETE file content. Never write
   "... rest of file unchanged" or any other placeholder — this will be rejected.
 - Use the exact same absolute path that was given in the input.
 - If a file does not need any change, omit it entirely from the output.
 - NEVER delete a file. NEVER emit <delete>, <remove>, <unlink> or any tag
-  other than <file>. File deletion and renaming are handled by separate tools
+  other than «file». File deletion and renaming are handled by separate tools
   that do not involve you. If the user instruction sounds like a deletion
-  ("delete the file X"), still output a <file> block — the wrapping tool will
+  ("delete the file X"), still output a «file» block — the wrapping tool will
   reject inappropriate deletes upstream.
 - Do NOT wrap code in ```java or any markdown fences.
 """
@@ -303,7 +336,7 @@ Rules:
 # ---------------------------------------------------------------------------
 # Output parsing
 # ---------------------------------------------------------------------------
-_FILE_BLOCK_RE = re.compile(r'<file path="([^"]+)">\n?(.*?)\n?</file>', re.DOTALL)
+_FILE_BLOCK_RE = re.compile(r'«file path="([^"]+)"»\n?(.*?)\n?«/file»', re.DOTALL)
 
 
 def _parse_file_blocks(text: str) -> dict[str, str]:
@@ -311,7 +344,7 @@ def _parse_file_blocks(text: str) -> dict[str, str]:
 
 
 def _fallback_markdown_extract(text: str, files: list[str]) -> dict[str, str]:
-    """If the model returned a fenced code block instead of a <file> block,
+    """If the model returned a fenced code block instead of a «file» block,
     map it to the only input file. Single-file only."""
     if len(files) != 1:
         return {}
@@ -322,7 +355,7 @@ def _fallback_markdown_extract(text: str, files: list[str]) -> dict[str, str]:
 
 
 def _extract_file_changes(raw: str, fallback_files: list[str]) -> dict[str, str]:
-    """Try <file> block parsing, then fall back to fenced markdown."""
+    """Try «file» block parsing, then fall back to fenced markdown."""
     changes = _parse_file_blocks(raw)
     if changes:
         return changes
@@ -335,7 +368,7 @@ def _call_with_parse_retry(
 ) -> tuple[dict[str, str] | None, str]:
     """
     Call the model with first_msg. If the output cannot be parsed into any
-    <file> block (nor a markdown-fenced fallback), retry ONCE with a stricter
+    «file» block (nor a markdown-fenced fallback), retry ONCE with a stricter
     user message that tells the model its previous output was malformed. If
     the retry also fails, return a bounded error — the raw output is truncated
     to PARSE_FAIL_ECHO_LIMIT chars so the caller's context is not blown up.
@@ -359,8 +392,8 @@ def _call_with_parse_retry(
     # the original task, but prepend a hard instruction about format.
     retry_msg = (
         "Your previous output was MALFORMED and could not be parsed. "
-        "Output ONLY <file> blocks in the exact format "
-        '<file path="/absolute/path">CONTENT</file>. No prose, no markdown '
+        "Output ONLY «file» blocks in the exact format "
+        '«file path="/absolute/path"»CONTENT«/file». No prose, no markdown '
         "fences, no other tags, no commentary. Try again.\n\n"
         f"{first_msg}"
     )
@@ -380,7 +413,7 @@ def _call_with_parse_retry(
     if len(raw) > PARSE_FAIL_ECHO_LIMIT:
         truncated += f"\n... [{len(raw) - PARSE_FAIL_ECHO_LIMIT} more chars truncated]"
     return None, (
-        "No <file> blocks found after retry. Raw output (truncated):\n"
+        "No «file» blocks found after retry. Raw output (truncated):\n"
         f"{truncated}"
     )
 
@@ -543,7 +576,7 @@ def local_edit(files: list[str], instruction: str) -> str:
 
     Edit one or more EXISTING files locally without round-tripping their contents
     through Claude. Reads the files, sends them to qwen3-coder:30b with the
-    instruction, parses <file> blocks from the response, validates every change
+    instruction, parses «file» blocks from the response, validates every change
     with server-side guard-rails, and atomically applies the result.
 
     This tool NEVER deletes or renames files. For deletion use local_delete; for
@@ -590,15 +623,16 @@ def local_edit(files: list[str], instruction: str) -> str:
 
     # 2. Build prompt — embed LF-normalized contents
     files_block = "\n\n".join(
-        f'<file path="{path}">\n{originals[path][0]}\n</file>'
+        f'«file path="{path}"»\n{originals[path][0]}\n«/file»'
         for path in files
     )
     user_msg = (
         f"{files_block}\n\n"
         f"Instruction: {instruction}\n\n"
-        f"IMPORTANT: Output ONLY <file> blocks. "
-        f"No markdown fences, no commentary, no other tags. /no_think"
+        f"IMPORTANT: Output ONLY «file» blocks. "
+        f"No markdown fences, no commentary, no other tags."
     )
+    user_msg = _maybe_no_think(user_msg)
 
     # 3. Call model (with one automatic retry on parse failure)
     file_changes_raw, err = _call_with_parse_retry(user_msg, files)
@@ -718,10 +752,10 @@ def local_write(path: str, instruction: str) -> str:
     user_msg = (
         f'Create a new file at the absolute path "{path}".\n\n'
         f"Instruction: {instruction}\n\n"
-        f'IMPORTANT: Output ONLY a single <file path="{path}"> block with the '
-        f"complete file content. No markdown fences, no commentary, no other tags. "
-        f"/no_think"
+        f'IMPORTANT: Output ONLY a single «file path="{path}"» block with the '
+        f"complete file content. No markdown fences, no commentary, no other tags."
     )
+    user_msg = _maybe_no_think(user_msg)
 
     file_changes_raw, err = _call_with_parse_retry(user_msg, [path])
     if file_changes_raw is None:
@@ -729,7 +763,7 @@ def local_write(path: str, instruction: str) -> str:
 
     if len(file_changes_raw) != 1:
         return (
-            f"[{chosen}] REJECTED — local_write expects exactly 1 <file> block, "
+            f"[{chosen}] REJECTED — local_write expects exactly 1 «file» block, "
             f"got {len(file_changes_raw)}."
         )
 
@@ -913,7 +947,7 @@ def local_snippet(prompt: str) -> str:
         "no summary, no markdown headings. If the user explicitly asks for an "
         "explanation, keep it to one short sentence."
     )
-    full_prompt = f"{prompt}\n\n/no_think"
+    full_prompt = _maybe_no_think(prompt)
     try:
         raw = _call_ollama(
             chosen,

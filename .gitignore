@@ -76,6 +76,9 @@ Thumbs.db
 models/
 *.gguf
 
+# Active model config (user-specific, not committed)
+model-config.json
+
 # Temporary files
 tmp/
 temp/

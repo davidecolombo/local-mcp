@@ -16,11 +16,9 @@ All instruction strings (`local_edit`, `local_write`, `local_snippet`) are check
 
 ## Models: single-model architecture
 
-| Tag                  | Type                          | Use for |
-|----------------------|-------------------------------|---------|
-| `qwen3-coder:30b`    | MoE 30B (3B active per token) | Everything: multi-file edits, scaffolding, snippets |
+All three Ollama-backed tools (`local_edit`, `local_write`, `local_snippet`) call **the same model**. There is no routing, no small/large tier, no model switching. There is no `model` parameter on any tool -- the model is server configuration, not a caller concern.
 
-All three Ollama-backed tools (`local_edit`, `local_write`, `local_snippet`) call **the same model**. There is no routing, no small/large tier, no model switching. There is no `model` parameter on any tool — the model is server configuration, not a caller concern.
+The default model is `qwen3-coder:30b`, but you can swap it via `model-config.json` (see [Model configuration](#model-configuration) below).
 
 ### Why a single model
 
@@ -35,23 +33,95 @@ The fix is to pick one model and pin it. `qwen3-coder:30b` wins because it's the
 
 Every Ollama call from this server passes `keep_alive: -1`. The model is loaded into VRAM on the first call of the session and **never unloaded**. No idle eviction, no thrashing, no cold-load latency on subsequent calls. After the first warmup, all calls go straight to compute.
 
-`/no_think` is appended to user prompts so qwen3 skips the reasoning chain (faster, less VRAM, deterministic edits don't benefit from visible reasoning). A defensive `<think>...</think>` stripper runs on the response in case any reasoning leaks through.
+### Qwen3-specific behavior
+
+When the configured model name contains `qwen3`, the server automatically:
+
+- Appends `/no_think` to user prompts so the model skips the reasoning chain (faster, less VRAM, deterministic edits don't benefit from visible reasoning).
+- Strips any `<think>...</think>` tags that leak through in the response.
+
+For non-Qwen3 models (e.g. Devstral), both behaviors are disabled automatically.
 
 ### Target hardware
 
-Designed and tested on: i9-14900K, 64 GB DDR5, RTX 5070 Ti 16 GB, **Windows 10**. The 30b coder fits 73% on GPU / 27% on CPU at Q4_K_M with `num_ctx=32768`; multi-file edits can take a few minutes (timeout is 20 min). Smaller GPUs will see a larger CPU split and proportionally lower tok/s.
+Designed and tested on: i9-14900K, 64 GB DDR5, RTX 5070 Ti 16 GB, **Windows 10**. The default 30b coder fits 73% on GPU / 27% on CPU at Q4_K_M with `num_ctx=32768`; multi-file edits can take a few minutes (timeout is 20 min). Smaller GPUs will see a larger CPU split and proportionally lower tok/s.
 
 ## Prerequisites
 
 - [Ollama](https://ollama.com) running locally on `http://localhost:11434`
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) in PATH
-- The coder model pulled:
+- Your chosen model pulled:
 
 ```bash
-ollama pull qwen3-coder:30b
+ollama pull qwen3-coder:30b    # default
+# or
+ollama pull devstral-small-2:24b  # alternative
 ```
 
 Dependencies for the server itself are managed automatically by `uv` via the inline script metadata in `server.py`. No manual `pip install`.
+
+## Model configuration
+
+The server reads an optional `model-config.json` file from the project root at startup. If the file is missing or any field is omitted, built-in defaults (matching `qwen3-coder:30b`) are used. The active config is gitignored -- it's a local concern, not committed.
+
+### Switching models
+
+Ready-to-use templates live in `configs/`:
+
+```bash
+# Switch to Devstral-Small
+cp configs/devstral-small-2-24b.json model-config.json
+
+# Switch back to Qwen3-Coder (or just delete model-config.json for defaults)
+cp configs/qwen3-coder-30b.json model-config.json
+```
+
+**Restart the MCP server after changing the config** (FastMCP loads it once at startup).
+
+### Available templates
+
+| Template | Model | Notes |
+|----------|-------|-------|
+| `configs/qwen3-coder-30b.json` | `qwen3-coder:30b` | Default. MoE 30B, ~3B active. Best tested option. |
+| `configs/devstral-small-2-24b.json` | `devstral-small-2:24b` | Mistral's code-agent model. Trained for structured output. Lower timeout (10 min). |
+| `configs/qwen3-30b.json` | `qwen3:30b` | Base Qwen3 (non-Coder). Same MoE architecture, broader training. |
+
+### Config fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | `"qwen3-coder:30b"` | Ollama model tag |
+| `ollama_url` | string | `"http://localhost:11434/api/chat"` | Ollama API endpoint |
+| `edit_ctx` | int | `32768` | Context window for edit/write calls |
+| `snippet_ctx` | int | `4096` | Context window for snippet calls |
+| `snippet_num_predict` | int | `1024` | Max output tokens for snippets |
+| `translate_ctx` | int | `2048` | Context window for translation pre-pass |
+| `translate_num_predict` | int | `512` | Max output tokens for translation |
+| `timeout` | int | `1200` | HTTP timeout in seconds |
+
+### Custom config example
+
+Only include the fields you want to override:
+
+```json
+{
+  "model": "devstral-small-2:24b",
+  "timeout": 600
+}
+```
+
+All other fields fall back to defaults.
+
+### Remote providers (planned)
+
+The config schema is designed to accommodate a future `"provider"` field for remote inference APIs. Candidates under consideration:
+
+- **OpenRouter** -- aggregator with many models including Qwen3-Coder-Next, DeepSeek-V3, Gemini 2.5 Flash. Some models available on free tier (`:free` suffix, rate-limited). Pricing for paid models: ~$0.005 per edit call at 32K context.
+- **Google AI Studio** -- generous free tier with Gemini 2.5 Flash and Pro. OpenAI-compatible API. Likely the strongest free option for structured output.
+- **Groq / Cerebras** -- free tiers with very fast inference (~300 tok/s). Good for snippet-style calls. Limited model selection.
+- **Together AI / Fireworks AI** -- cheap pay-as-you-go with DeepSeek-V3 and Qwen3 variants. OpenAI-compatible endpoints.
+
+These would trade local GPU compute for network latency, with a potential hybrid approach (remote primary, local fallback).
 
 ## Installation
 
@@ -65,7 +135,7 @@ claude mcp add --scope user local-mcp uv run "C:/Users/user/.claude/local-mcp/se
 
 ### `local_edit(files, instruction)`
 
-Edit one or more **existing** files in place. Reads the files, sends them to `qwen3-coder:30b`, parses `<file>` blocks from the response, validates with guard-rails, and atomically applies the result. Claude only sees a one-line summary or a structured rejection.
+Edit one or more **existing** files in place. Reads the files, sends them to the configured model, parses `«file»` blocks from the response, validates with guard-rails, and atomically applies the result. Claude only sees a one-line summary or a structured rejection.
 
 ```
 files:       list of absolute file paths
@@ -74,7 +144,7 @@ instruction: what to change (any language; include "delete"/"remove"/"strip"
              reduction in size, otherwise the shrink guard will reject)
 ```
 
-`local_edit` **never deletes or renames files**. For deletion call `local_delete`; for rename/move call `local_rename`. The model is forbidden from emitting any tag other than `<file>`, and the parser only recognizes `<file>` blocks.
+`local_edit` **never deletes or renames files**. For deletion call `local_delete`; for rename/move call `local_rename`. The model is forbidden from emitting any tag other than `«file»`, and the parser only recognizes `«file»` blocks.
 
 ### `local_write(path, instruction)`
 
@@ -114,7 +184,7 @@ prompt: the task or question (any language)
 
 The old setup occasionally wrote empty / partially-truncated files, or hollowed out class stubs when the user actually wanted the file *deleted*. All checks below run **inside the server**, so Claude only sees a short accept/reject summary; guard-rails cost zero Claude tokens.
 
-For each `<file>` block emitted by the model:
+For each `«file»` block emitted by the model:
 
 1. **Non-empty**: empty or whitespace-only content is rejected (use `local_delete` to remove a file).
 2. **No truncation markers**: lines whose entire trimmed content matches a lazy-output marker (`... rest of file unchanged`, `// ... existing code ...`, `<TRUNCATED>`, etc.) are rejected, but **only if the same line wasn't already in the original**. So legitimate template files don't trip the check.
@@ -122,7 +192,7 @@ For each `<file>` block emitted by the model:
 4. **Bracket delta unchanged**: for `.py .java .js .ts .tsx .jsx .go .rs .c .cpp .h .hpp .json`, the unmatched-bracket count `({}, (), [])` of the new file must match the original's. Comparing the *delta* lets strings/comments cancel symmetrically and avoids false positives. Catches mid-stream truncation cheaply.
 5. **Semantic parse** (`.py`, `.json` only): the new content is fed to `ast.parse` / `json.loads`. Syntax errors are rejected with the offending line number. This is a real parser — it catches unterminated strings, stray indentation, missing commas, and other truncation patterns the bracket heuristic cannot see. For other extensions the check is a no-op (adding JS/TS would require shelling out to `node --check`).
 6. **Identity no-op**: files where the model returned the original verbatim are silently dropped from the batch.
-7. **Path allowlist**: the model can only emit `<file>` blocks for paths that were passed in `files`. Any unknown path rejects the entire batch.
+7. **Path allowlist**: the model can only emit `«file»` blocks for paths that were passed in `files`. Any unknown path rejects the entire batch.
 
 If any guard fails on any change, **the entire batch is rejected** and a structured diagnostic is returned. No partial writes ever.
 
@@ -132,7 +202,7 @@ Note: there is no `<delete/>` guard-rail because there is no `<delete/>` block. 
 
 ### Parse-failure retry
 
-If the model returns output that contains no `<file>` block (and no fenced-markdown fallback either), the server **automatically retries once** with a stricter user message (`"Your previous output was MALFORMED..."`) before surfacing an error. This protects Claude's context from seeing the first malformed dump at all. If the retry also fails, the raw output echoed in the error is capped at ~600 chars so a rambling model response can't blow up the context.
+If the model returns output that contains no `«file»` block (and no fenced-markdown fallback either), the server **automatically retries once** with a stricter user message (`"Your previous output was MALFORMED..."`) before surfacing an error. This protects Claude's context from seeing the first malformed dump at all. If the retry also fails, the raw output echoed in the error is capped at ~600 chars so a rambling model response can't blow up the context.
 
 ### Atomic apply
 
@@ -165,7 +235,7 @@ The server speaks MCP over stdio. When launched normally by Claude Code it start
 curl http://localhost:11434/api/tags
 ```
 
-Should return a JSON list of installed models including `qwen3-coder:30b`.
+Should return a JSON list of installed models including your configured model.
 
 ## Reuse in other projects
 
@@ -194,7 +264,7 @@ What it does (idempotent; safe to re-run):
 2. Creates `<project>\CLAUDE.md` if missing, or appends to it. The guidance block is delimited by `<!-- BEGIN local-mcp -->` / `<!-- END local-mcp -->` markers, so re-running replaces the block in place rather than duplicating it.
 3. With `-Remove`: pulls `Edit`/`Write` back out of the deny array, and strips the marker block from `CLAUDE.md`. Empty files (created from scratch by the setup) are deleted; files with other content are preserved.
 
-After running the script, **restart Claude Code in that project** for the new settings to take effect. Then in a new session, ask Claude to make a non-trivial edit; it will be forced to call `local_edit`, and the result will carry the `[qwen3-coder:30b]` prefix instead of going through the built-in `Edit` tool.
+After running the script, **restart Claude Code in that project** for the new settings to take effect. Then in a new session, ask Claude to make a non-trivial edit; it will be forced to call `local_edit`, and the result will carry the `[<model>]` prefix (e.g. `[qwen3-coder:30b]`) instead of going through the built-in `Edit` tool.
 
 PowerShell 5.1 (default on Windows 10) is supported. No external dependencies.
 
@@ -247,9 +317,9 @@ python -c "import py_compile; py_compile.compile(r'C:/Users/user/.claude/local-m
 
 After restarting the MCP server (FastMCP loads `server.py` once at startup; `/mcp` reconnect or restart the Claude CLI):
 
-- `local_snippet("write a regex for ISO-8601 dates")` → first call eats the load cost (~5–10 s warmup); subsequent calls return in well under 10 s. All calls go to `qwen3-coder:30b` (`[qwen3-coder:30b]` prefix in the result).
-- `local_write` on a fresh scratch path → confirm file is created with sane content and a `[qwen3-coder:30b] Created ...` summary.
-- `local_edit` on a single small file with a short instruction → confirm `[qwen3-coder:30b]` prefix and the edit lands.
+- `local_snippet("write a regex for ISO-8601 dates")` → first call eats the load cost (~5-10 s warmup); subsequent calls return in well under 10 s. The result carries the configured model name as prefix (e.g. `[qwen3-coder:30b]`).
+- `local_write` on a fresh scratch path → confirm file is created with sane content and a `[<model>] Created ...` summary.
+- `local_edit` on a single small file with a short instruction → confirm `[<model>]` prefix and the edit lands.
 - `local_edit` on 3+ files with a longer instruction → same model, same behavior.
 
 Between calls, run `ollama ps` from another terminal: the model should stay loaded with no eviction (no `0%` keep_alive countdown).
@@ -261,7 +331,7 @@ After 5+ minutes of idle, run `ollama ps` again. With `keep_alive: -1`, the `UNT
 ### 4. Guard-rail regression tests (these are the failures from the deepseek era)
 
 - **Method removal**: ask `local_edit` to "remove unused method foo" on a small file → confirm the method is removed and the rest of the file is still intact (not truncated).
-- **File deletion**: call `local_delete([path])` directly → confirm the file is removed and no LLM call is made (check `ollama ps` token counter is unchanged). `local_edit` itself can no longer delete files; if the model emits any non-`<file>` tag it is silently ignored.
+- **File deletion**: call `local_delete([path])` directly → confirm the file is removed and no LLM call is made (check `ollama ps` token counter is unchanged). `local_edit` itself can no longer delete files; if the model emits any non-`«file»` tag it is silently ignored.
 - **File rename**: call `local_rename(src, dst)` → confirm `src` is gone, `dst` exists with the same bytes, and again no LLM call. Then call it again with the same args → expect a clean `dst already exists` error.
 - **Non-English instruction**: call `local_edit` with `instruction="rimuovi il metodo foo"` (Italian) or `"supprime la méthode foo"` (French) → confirm the edit succeeds and the shrink guard does NOT reject (the translation pre-pass converts the removal verb to English before the guard runs).
 - **Suspicious shrink rejection**: pass a non-trivial file with a vague instruction that causes the model to return near-empty content → confirm the shrink guard rejects and **no file on disk is touched**.
