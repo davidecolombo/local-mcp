@@ -16,7 +16,7 @@ All instruction strings (`local_edit`, `local_write`, `local_snippet`) are check
 
 ## Models: single-model architecture
 
-All three Ollama-backed tools (`local_edit`, `local_write`, `local_snippet`) call **the same model**. There is no routing, no small/large tier, no model switching. There is no `model` parameter on any tool -- the model is server configuration, not a caller concern.
+All three Ollama-backed tools (`local_edit`, `local_write`, `local_snippet`) call **the same model**. There is no routing, no small/large tier, no model switching. There is no `model` parameter on any tool; the model is server configuration, not a caller concern.
 
 The default model is `qwen3-coder:30b`, but you can swap it via `model-config.json` (see [Model configuration](#model-configuration) below).
 
@@ -62,7 +62,7 @@ Dependencies for the server itself are managed automatically by `uv` via the inl
 
 ## Model configuration
 
-The server reads an optional `model-config.json` file from the project root at startup. If the file is missing or any field is omitted, built-in defaults (matching `qwen3-coder:30b`) are used. The active config is gitignored -- it's a local concern, not committed.
+The server reads an optional `model-config.json` file from the project root at startup. If the file is missing or any field is omitted, built-in defaults (matching `qwen3-coder:30b`) are used. The active config is gitignored; it's a local concern, not committed.
 
 ### Switching models
 
@@ -116,10 +116,10 @@ All other fields fall back to defaults.
 
 The config schema is designed to accommodate a future `"provider"` field for remote inference APIs. Candidates under consideration:
 
-- **OpenRouter** -- aggregator with many models including Qwen3-Coder-Next, DeepSeek-V3, Gemini 2.5 Flash. Some models available on free tier (`:free` suffix, rate-limited). Pricing for paid models: ~$0.005 per edit call at 32K context.
-- **Google AI Studio** -- generous free tier with Gemini 2.5 Flash and Pro. OpenAI-compatible API. Likely the strongest free option for structured output.
-- **Groq / Cerebras** -- free tiers with very fast inference (~300 tok/s). Good for snippet-style calls. Limited model selection.
-- **Together AI / Fireworks AI** -- cheap pay-as-you-go with DeepSeek-V3 and Qwen3 variants. OpenAI-compatible endpoints.
+- **OpenRouter**: aggregator with many models including Qwen3-Coder-Next, DeepSeek-V3, Gemini 2.5 Flash. Some models available on free tier (`:free` suffix, rate-limited). Pricing for paid models: ~$0.005 per edit call at 32K context.
+- **Google AI Studio**: generous free tier with Gemini 2.5 Flash and Pro. OpenAI-compatible API. Likely the strongest free option for structured output.
+- **Groq / Cerebras**: free tiers with very fast inference (~300 tok/s). Good for snippet-style calls. Limited model selection.
+- **Together AI / Fireworks AI**: cheap pay-as-you-go with DeepSeek-V3 and Qwen3 variants. OpenAI-compatible endpoints.
 
 These would trade local GPU compute for network latency, with a potential hybrid approach (remote primary, local fallback).
 
