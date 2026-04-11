@@ -1,0 +1,14 @@
+{
+  "provider": "openrouter",
+  "model": "openrouter/free",
+  "openrouter_url": "https://openrouter.ai/api/v1/chat/completions",
+  "openrouter_referer": "https://claude.ai/code",
+  "openrouter_title": "local-mcp",
+  "openrouter_extra_body": {},
+  "edit_ctx": 32768,
+  "snippet_ctx": 4096,
+  "snippet_num_predict": 1024,
+  "translate_ctx": 2048,
+  "translate_num_predict": 512,
+  "timeout": 60
+}

@@ -86,17 +86,23 @@ cp configs/qwen3-coder-30b.json model-config.json
 | `configs/qwen3-coder-30b.json` | `qwen3-coder:30b` | Default. MoE 30B, ~3B active. Best tested option. |
 | `configs/devstral-small-2-24b.json` | `devstral-small-2:24b` | Mistral's code-agent model. Trained for structured output. Lower timeout (10 min). |
 | `configs/qwen3-30b.json` | `qwen3:30b` | Base Qwen3 (non-Coder). Same MoE architecture, broader training. |
+| `configs/openrouter-free.json` | `openrouter/free` | Remote via OpenRouter free-models router; requires `OPENROUTER_API_KEY` env var; model choice is non-deterministic per call. |
 
 ### Config fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | `"qwen3-coder:30b"` | Ollama model tag |
-| `ollama_url` | string | `"http://localhost:11434/api/chat"` | Ollama API endpoint |
-| `edit_ctx` | int | `32768` | Context window for edit/write calls |
-| `snippet_ctx` | int | `4096` | Context window for snippet calls |
+| `provider` | string | `"ollama"` | Inference provider: `"ollama"` or `"openrouter"` |
+| `model` | string | `"qwen3-coder:30b"` | Model identifier (Ollama tag or OpenRouter slug) |
+| `ollama_url` | string | `"http://localhost:11434/api/chat"` | Ollama API endpoint (ignored for openrouter) |
+| `openrouter_url` | string | `"https://openrouter.ai/api/v1/chat/completions"` | OpenRouter endpoint (ignored for ollama) |
+| `openrouter_referer` | string | `"https://github.com/local-mcp"` | `HTTP-Referer` header sent to OpenRouter |
+| `openrouter_title` | string | `"local-mcp"` | `X-Title` header sent to OpenRouter |
+| `openrouter_extra_body` | object | `{}` | Merged into the request body; use for `models`, `route`, `provider` filters |
+| `edit_ctx` | int | `32768` | Context window for edit/write calls (Ollama only; ignored by OpenRouter) |
+| `snippet_ctx` | int | `4096` | Context window for snippet calls (Ollama only) |
 | `snippet_num_predict` | int | `1024` | Max output tokens for snippets |
-| `translate_ctx` | int | `2048` | Context window for translation pre-pass |
+| `translate_ctx` | int | `2048` | Context window for translation pre-pass (Ollama only) |
 | `translate_num_predict` | int | `512` | Max output tokens for translation |
 | `timeout` | int | `1200` | HTTP timeout in seconds |
 
@@ -113,16 +119,43 @@ Only include the fields you want to override:
 
 All other fields fall back to defaults.
 
-### Remote providers (planned)
+### Remote providers
 
-The config schema is designed to accommodate a future `"provider"` field for remote inference APIs. Candidates under consideration:
+Set `"provider": "openrouter"` in `model-config.json` to route calls through a remote
+OpenAI-compatible endpoint instead of local Ollama. The token-saving property is preserved:
+file bodies still never pass through Claude's context; only the summary does.
 
-- **OpenRouter**: aggregator with many models including Qwen3-Coder-Next, DeepSeek-V3, Gemini 2.5 Flash. Some models available on free tier (`:free` suffix, rate-limited). Pricing for paid models: ~$0.005 per edit call at 32K context.
-- **Google AI Studio**: generous free tier with Gemini 2.5 Flash and Pro. OpenAI-compatible API. Likely the strongest free option for structured output.
-- **Groq / Cerebras**: free tiers with very fast inference (~300 tok/s). Good for snippet-style calls. Limited model selection.
-- **Together AI / Fireworks AI**: cheap pay-as-you-go with DeepSeek-V3 and Qwen3 variants. OpenAI-compatible endpoints.
+#### OpenRouter (implemented)
 
-These would trade local GPU compute for network latency, with a potential hybrid approach (remote primary, local fallback).
+OpenRouter is an aggregator with access to many models, including a free-models router
+that dispatches each call to a rotating pool of `:free` tier models at zero cost.
+
+To use it:
+
+1. Create an account at https://openrouter.ai and generate an API key.
+2. Set the environment variable: `$env:OPENROUTER_API_KEY = "sk-or-..."`
+3. Copy the template: `cp configs\openrouter-free.json model-config.json`
+4. Restart the MCP server.
+
+The free-models router model slug (`openrouter/free`) selects a different free model per
+call from OpenRouter's free tier only. **Important: do NOT use `openrouter/auto`, which
+routes to paid models and will incur charges.** See https://openrouter.ai/docs/guides/routing/routers/free-models-router
+for the current routing behavior and list of free models. Caveats: non-deterministic model
+choice per call, rate-limited (HTTP 429 on excess), network latency instead of local GPU
+compute.
+
+To use a specific paid model intentionally, change the `model` field to a paid model slug
+and optionally set a budget via `openrouter_extra_body`. See the OpenRouter docs for
+available model slugs.
+
+#### Planned providers
+
+- **Google AI Studio**: generous free tier with Gemini 2.5 Flash and Pro. OpenAI-compatible API.
+- **Groq / Cerebras**: free tiers with very fast inference. Good for snippet calls.
+- **Together AI / Fireworks AI**: cheap pay-as-you-go with DeepSeek-V3 and Qwen3 variants.
+
+These would use the same `provider` config field with different `openrouter_url` values or a
+new provider slug.
 
 ## Installation
 

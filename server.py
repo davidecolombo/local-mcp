@@ -63,8 +63,17 @@ mcp = FastMCP("local-mcp")
 # See configs/ for ready-to-use templates.
 # ---------------------------------------------------------------------------
 _CONFIG_DEFAULTS: dict = {
+    # Provider: "ollama" (default, local) or "openrouter" (remote, OpenAI-compat).
+    "provider": "ollama",
     "model": "qwen3-coder:30b",
+    # Ollama-specific
     "ollama_url": "http://localhost:11434/api/chat",
+    # OpenRouter-specific (ignored when provider="ollama")
+    "openrouter_url": "https://openrouter.ai/api/v1/chat/completions",
+    "openrouter_referer": "https://claude.ai/code",
+    "openrouter_title": "local-mcp",
+    "openrouter_extra_body": {},
+    # Shared
     "edit_ctx": 32768,
     "snippet_ctx": 4096,
     "snippet_num_predict": 1024,
@@ -96,17 +105,33 @@ def _load_model_config() -> dict:
 
 _cfg = _load_model_config()
 
-MODEL: str               = _cfg["model"]
-OLLAMA_URL: str           = _cfg["ollama_url"]
-EDIT_CTX: int             = _cfg["edit_ctx"]
-SNIPPET_CTX: int          = _cfg["snippet_ctx"]
-SNIPPET_NUM_PREDICT: int  = _cfg["snippet_num_predict"]
-TRANSLATE_CTX: int        = _cfg["translate_ctx"]
+PROVIDER: str              = _cfg["provider"]
+MODEL: str                 = _cfg["model"]
+OLLAMA_URL: str            = _cfg["ollama_url"]
+OPENROUTER_URL: str        = _cfg["openrouter_url"]
+OPENROUTER_REFERER: str    = _cfg["openrouter_referer"]
+OPENROUTER_TITLE: str      = _cfg["openrouter_title"]
+OPENROUTER_EXTRA_BODY: dict = _cfg["openrouter_extra_body"]
+EDIT_CTX: int              = _cfg["edit_ctx"]
+SNIPPET_CTX: int           = _cfg["snippet_ctx"]
+SNIPPET_NUM_PREDICT: int   = _cfg["snippet_num_predict"]
+TRANSLATE_CTX: int         = _cfg["translate_ctx"]
 TRANSLATE_NUM_PREDICT: int = _cfg["translate_num_predict"]
-TIMEOUT: int              = _cfg["timeout"]
+TIMEOUT: int               = _cfg["timeout"]
+
+if PROVIDER == "openrouter":
+    _OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
+    if not _OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "provider=openrouter requires the OPENROUTER_API_KEY environment variable. "
+            'Set it before starting the server: $env:OPENROUTER_API_KEY = "sk-or-..."'
+        )
+else:
+    _OPENROUTER_API_KEY = ""
 
 # One GPU, one request at a time. Non-blocking: callers get an immediate
 # error rather than queueing behind a long-running generation.
+# Only acquired by _call_ollama; _call_openrouter does not need it.
 _OLLAMA_LOCK = threading.Lock()
 
 # Qwen3-specific: /no_think suppresses the reasoning chain, and a defensive
@@ -211,6 +236,78 @@ def _call_ollama(
         _OLLAMA_LOCK.release()
 
 
+def _call_openrouter(
+    model: str,
+    messages: list[dict],
+    system: str | None = None,
+    num_ctx: int | None = None,       # accepted but ignored; OpenRouter decides context
+    num_predict: int | None = None,   # -> max_tokens
+) -> str:
+    """Call an OpenAI-compatible remote endpoint (OpenRouter) with SSE streaming."""
+    full_messages: list[dict] = []
+    if system:
+        full_messages.append({"role": "system", "content": system})
+    full_messages.extend(messages)
+
+    payload: dict = {
+        "model": model,
+        "messages": full_messages,
+        "stream": True,
+    }
+    if num_predict is not None:
+        payload["max_tokens"] = num_predict
+    if OPENROUTER_EXTRA_BODY:
+        payload.update(OPENROUTER_EXTRA_BODY)
+
+    headers = {
+        "Authorization": f"Bearer {_OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_REFERER,
+        "X-Title": OPENROUTER_TITLE,
+    }
+
+    chunks: list[str] = []
+    with httpx.stream(
+        "POST", OPENROUTER_URL, json=payload, headers=headers, timeout=TIMEOUT
+    ) as resp:
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:400]
+            raise httpx.HTTPError(
+                f"OpenRouter returned {e.response.status_code}: {body}"
+            ) from e
+        for line in resp.iter_lines():
+            if not line or not line.startswith("data: "):
+                continue
+            payload_str = line[len("data: "):]
+            if payload_str.strip() == "[DONE]":
+                break
+            try:
+                data = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
+            content = (
+                data.get("choices", [{}])[0].get("delta", {}).get("content") or ""
+            )
+            if content:
+                chunks.append(content)
+    return "".join(chunks)
+
+
+def _call_model(
+    model: str,
+    messages: list[dict],
+    system: str | None = None,
+    num_ctx: int | None = None,
+    num_predict: int | None = None,
+) -> str:
+    """Dispatch to the configured provider (Ollama or OpenRouter)."""
+    if PROVIDER == "openrouter":
+        return _call_openrouter(model, messages, system, num_ctx, num_predict)
+    return _call_ollama(model, messages, system, num_ctx, num_predict)
+
+
 def _strip_think_tags(text: str) -> str:
     """Strip <think>...</think> if a qwen3 model emits any. No-op for other models."""
     if not _IS_QWEN3:
@@ -286,7 +383,7 @@ def _normalize_instruction(instruction: str) -> str:
     if _is_probably_english(instruction):
         return instruction
     try:
-        translated = _call_ollama(
+        translated = _call_model(
             MODEL,
             [{"role": "user", "content": (
                 "Translate the following instruction to English. Output ONLY "
@@ -388,11 +485,11 @@ def _call_with_parse_retry(
     None and error is a human-readable diagnostic.
     """
     try:
-        raw = _call_ollama(
+        raw = _call_model(
             MODEL, [{"role": "user", "content": first_msg}], system=EDIT_SYSTEM
         )
     except httpx.HTTPError as e:
-        return None, f"Ollama call failed: {e}"
+        return None, f"Model call failed: {e}"
     raw = _strip_think_tags(raw)
 
     changes = _extract_file_changes(raw, fallback_files)
@@ -407,11 +504,11 @@ def _call_with_parse_retry(
         f"{first_msg}"
     )
     try:
-        raw = _call_ollama(
+        raw = _call_model(
             MODEL, [{"role": "user", "content": retry_msg}], system=EDIT_SYSTEM
         )
     except httpx.HTTPError as e:
-        return None, f"Ollama call failed on retry: {e}"
+        return None, f"Model call failed on retry: {e}"
     raw = _strip_think_tags(raw)
 
     changes = _extract_file_changes(raw, fallback_files)
@@ -918,7 +1015,7 @@ def local_snippet(prompt: str) -> str:
     )
     full_prompt = _maybe_no_think(prompt)
     try:
-        raw = _call_ollama(
+        raw = _call_model(
             chosen,
             [{"role": "user", "content": full_prompt}],
             system=snippet_system,
@@ -926,7 +1023,7 @@ def local_snippet(prompt: str) -> str:
             num_predict=SNIPPET_NUM_PREDICT,
         )
     except httpx.HTTPError as e:
-        return f"[{chosen}] Ollama call failed: {e}"
+        return f"[{chosen}] Model call failed: {e}"
     return _strip_think_tags(raw)
 
 
