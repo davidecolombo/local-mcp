@@ -50,6 +50,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 
 import httpx
@@ -103,6 +104,10 @@ SNIPPET_NUM_PREDICT: int  = _cfg["snippet_num_predict"]
 TRANSLATE_CTX: int        = _cfg["translate_ctx"]
 TRANSLATE_NUM_PREDICT: int = _cfg["translate_num_predict"]
 TIMEOUT: int              = _cfg["timeout"]
+
+# One GPU, one request at a time. Non-blocking: callers get an immediate
+# error rather than queueing behind a long-running generation.
+_OLLAMA_LOCK = threading.Lock()
 
 # Qwen3-specific: /no_think suppresses the reasoning chain, and a defensive
 # stripper catches any <think> tags that leak through.
@@ -178,22 +183,32 @@ def _call_ollama(
     # Streaming: timeout applies per-chunk, not to the whole response.
     # This avoids false timeouts when the model outputs a large file; as long
     # as the model keeps producing tokens the connection stays alive.
-    chunks: list[str] = []
-    with httpx.stream("POST", OLLAMA_URL, json=payload, timeout=TIMEOUT) as resp:
-        resp.raise_for_status()
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            content = data.get("message", {}).get("content", "")
-            if content:
-                chunks.append(content)
-            if data.get("done", False):
-                break
-    return "".join(chunks)
+    # Non-blocking lock: if another call is already running, fail immediately
+    # rather than queueing (a queued call would time out behind a long generation).
+    if not _OLLAMA_LOCK.acquire(blocking=False):
+        raise httpx.HTTPError(
+            "Ollama busy: another local_* call is in progress. "
+            "Retry this call sequentially after the current one completes."
+        )
+    try:
+        chunks: list[str] = []
+        with httpx.stream("POST", OLLAMA_URL, json=payload, timeout=TIMEOUT) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = data.get("message", {}).get("content", "")
+                if content:
+                    chunks.append(content)
+                if data.get("done", False):
+                    break
+        return "".join(chunks)
+    finally:
+        _OLLAMA_LOCK.release()
 
 
 def _strip_think_tags(text: str) -> str:
@@ -562,6 +577,8 @@ def _check_bracket_delta(new: str, original: str | None, ext: str) -> str | None
 @mcp.tool()
 def local_edit(files: list[str], instruction: str) -> str:
     """
+    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
+
     Edit one or more EXISTING files locally. USE INSTEAD OF the built-in Edit
     tool: file contents never enter Claude's context, which is how this saves
     tokens. Validates every change with server-side guard-rails and applies
@@ -697,6 +714,8 @@ def local_edit(files: list[str], instruction: str) -> str:
 @mcp.tool()
 def local_write(path: str, instruction: str) -> str:
     """
+    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
+
     Create a NEW file from scratch locally. USE INSTEAD OF the built-in Write
     tool: the generated content never enters Claude's context, only a short
     summary is returned. Refuses to overwrite an existing file; use local_edit
@@ -877,6 +896,8 @@ def local_rename(src: str, dst: str) -> str:
 @mcp.tool()
 def local_snippet(prompt: str) -> str:
     """
+    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
+
     FALLBACK tool for short text with no file destination (regex, SQL,
     one-liners). Output DOES flow back into Claude's context and costs input
     tokens, so prefer local_edit / local_write whenever the result will land
