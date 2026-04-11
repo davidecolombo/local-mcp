@@ -38,7 +38,10 @@ $ErrorActionPreference = 'Stop'
 # Constants
 # ---------------------------------------------------------------------------
 
-$DenyEntries  = @('Edit', 'Write')
+$DenyEntries        = @('Edit')
+# Full set of entries this script has ever managed; used to prune stale denies
+# from projects set up with an older version of this script.
+$ManagedDenyEntries = @('Edit', 'Write')
 $BeginMarker  = '<!-- BEGIN local-mcp -->'
 $EndMarker    = '<!-- END local-mcp -->'
 
@@ -46,18 +49,16 @@ $ClaudeMdBlock = @"
 $BeginMarker
 ## Use of the local-mcp server
 
-For file operations, ALWAYS use the tools from the ``local-mcp`` server:
-- ``local_edit`` instead of ``Edit`` (modifying existing files in place)
-- ``local_write`` instead of ``Write`` (creating new files)
+For file operations, use the tools from the ``local-mcp`` server:
+- ``local_edit`` instead of ``Edit`` (modifying existing files in place; always a token win)
+- ``local_write`` for NEW files ONLY when a concise instruction expands into a much larger file: stubs, boilerplate, scaffolds, config templates. If you would dictate content line-by-line, use the built-in ``Write`` instead -- the local model round-trip adds overhead without saving tokens.
 - ``local_delete`` instead of ``Bash rm`` (deleting files; no model call)
 - ``local_rename`` instead of ``Bash mv`` (rename / move; no model call, atomic within a volume)
 - ``local_snippet`` only as a fallback for snippets with no file destination
 
-Reason: token savings -- for ``local_edit`` / ``local_write`` the file
-contents never pass through Claude's context, and ``local_delete`` /
-``local_rename`` are pure syscalls that cost nothing beyond the tool
-invocation itself. The built-in ``Edit`` and ``Write`` tools are denied via
-``.claude/settings.json`` to enforce this workflow.
+Break-even rule for ``local_write``: savings only occur when ``len(instruction) << len(file)``. When you already know the exact content -- copied pattern, specific function bodies, precise config values -- use ``Write``; same token cost without the extra round-trip.
+
+Reason: for ``local_edit`` the file contents never pass through Claude's context (diffs compress well), and ``local_delete`` / ``local_rename`` are pure syscalls. The built-in ``Edit`` tool is denied via ``.claude/settings.json``; ``Write`` remains available for the cases above.
 
 ### Instructions can be in any language
 
@@ -178,6 +179,16 @@ function Apply-Settings {
 
     # @() forces array form even if deny was a scalar string in the source JSON.
     $existing = @($perms.deny)
+
+    # Remove any entry this script formerly managed but no longer wants denied.
+    $pruned = @()
+    $existing = @($existing | Where-Object {
+        if ($ManagedDenyEntries -contains $_) {
+            if ($DenyEntries -contains $_) { $true } else { $pruned += $_; $false }
+        } else { $true }
+    })
+
+    # Add any newly required entry not already present.
     $added = @()
     foreach ($entry in $DenyEntries) {
         if ($existing -notcontains $entry) {
@@ -188,11 +199,14 @@ function Apply-Settings {
     # Assign back as a real array (force with @() to defeat single-elem unwrap).
     $perms.deny = @($existing)
 
-    if ($added.Count -eq 0) {
-        Write-Host "[=] .claude/settings.json already has Edit/Write in deny" -ForegroundColor DarkGray
+    if ($added.Count -eq 0 -and $pruned.Count -eq 0) {
+        Write-Host "[=] .claude/settings.json deny already up to date" -ForegroundColor DarkGray
     } else {
         Write-JsonFile -FilePath $SettingsPath -Object $obj
-        Write-Host "[~] Updated .claude/settings.json (added: $($added -join ', '))" -ForegroundColor Yellow
+        $parts = @()
+        if ($added.Count -gt 0) { $parts += "added: $($added -join ', ')" }
+        if ($pruned.Count -gt 0) { $parts += "removed: $($pruned -join ', ')" }
+        Write-Host "[~] Updated .claude/settings.json ($($parts -join '; '))" -ForegroundColor Yellow
     }
 }
 
@@ -222,7 +236,7 @@ function Remove-Settings {
     $filtered = @($existing | Where-Object { $DenyEntries -notcontains $_ })
 
     if ($filtered.Count -eq $existing.Count) {
-        Write-Host "[=] .claude/settings.json deny did not contain Edit/Write" -ForegroundColor DarkGray
+        Write-Host "[=] .claude/settings.json deny contained none of the managed entries" -ForegroundColor DarkGray
         return
     }
 
@@ -243,7 +257,7 @@ function Remove-Settings {
         Write-Host "[-] Removed empty .claude/settings.json" -ForegroundColor Yellow
     } else {
         Write-JsonFile -FilePath $SettingsPath -Object $obj
-        Write-Host "[~] Updated .claude/settings.json (removed Edit/Write from deny)" -ForegroundColor Yellow
+        Write-Host "[~] Updated .claude/settings.json (removed managed deny entries)" -ForegroundColor Yellow
     }
 }
 

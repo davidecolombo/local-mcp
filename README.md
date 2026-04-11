@@ -6,7 +6,8 @@ MCP server that delegates implementation work to local Ollama models so Claude (
 
 The big savings come from **never round-tripping file contents through Claude's context**:
 
-- `local_edit` and `local_write` read and write files on the MCP side. Claude sends a short instruction and gets back a one-line summary. **These are the tools that save the most tokens; prefer them whenever a result will land in a file.**
+- `local_edit` reads and writes existing files on the MCP side. Claude sends a short diff-shaped instruction and gets back a one-line summary. **This is an unconditional token win; always prefer it over the built-in `Edit`.**
+- `local_write` creates new files the same way, but savings are conditional: the instruction must be much shorter than the file it produces. Good fits: stubs, boilerplate, scaffolds, config templates (short spec, large output). Bad fit: dictating exact content line-by-line — in that case the instruction approaches the file size and the local-model round-trip adds overhead for no gain. Use the built-in `Write` for dictated content.
 - `local_delete` and `local_rename` are pure filesystem operations — no model call at all. They exist so the caller never has to ask the model to decide *whether* to delete or move a file; the caller already knows.
 - `local_snippet` returns generated text that flows back through Claude. It's useful as a fallback for regex / SQL / one-liners that have no file destination yet, but every byte of its output costs Claude input tokens. Use sparingly.
 
@@ -148,11 +149,12 @@ instruction: what to change (any language; include "delete"/"remove"/"strip"
 
 ### `local_write(path, instruction)`
 
-Create a **new** file from scratch entirely on the local side. Refuses to overwrite an existing file (use `local_edit` for that). The generated content never enters Claude's context.
+Create a **new** file from scratch entirely on the local side. Saves tokens only when the instruction is much shorter than the file it produces. Best for: stubs, boilerplate, scaffolds, config templates, canonical patterns. If you would dictate content line-by-line, use the built-in `Write` instead: same token cost, no local-model round-trip. Refuses to overwrite an existing file (use `local_edit` for that).
 
 ```
 path:        absolute path of the file to create
-instruction: what to put in the file (any language; can be detailed)
+instruction: concise spec in any language; if it approaches the length
+             of the file itself, use Write instead
 ```
 
 ### `local_delete(paths)`

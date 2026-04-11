@@ -716,15 +716,19 @@ def local_write(path: str, instruction: str) -> str:
     """
     IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
 
-    Create a NEW file from scratch locally. USE INSTEAD OF the built-in Write
-    tool: the generated content never enters Claude's context, only a short
-    summary is returned. Refuses to overwrite an existing file; use local_edit
-    for that.
+    Create a NEW file from scratch locally. Only saves tokens when the
+    instruction is MUCH shorter than the file it produces. Good fits: stubs,
+    boilerplate, scaffolds, config files, canonical patterns — cases where a
+    1-2 sentence spec expands to many lines. Bad fits: any case where you
+    would dictate content line-by-line; use the built-in Write tool instead
+    (same token cost, no local-model round-trip overhead). Refuses to
+    overwrite an existing file; use local_edit for that.
 
     Args:
         path:        Absolute path of the file to create.
-        instruction: What to put in the file (any language; translated to
-                     English server-side; can be detailed).
+        instruction: Concise spec in any language (translated to English
+                     server-side). Keep this short: if your instruction
+                     approaches the length of the file itself, use Write.
 
     Returns the created path or a guard-rail rejection diagnostic.
     """
