@@ -276,30 +276,25 @@ def _normalize_instruction(instruction: str) -> str:
 # System prompt for edit/write tools
 # ---------------------------------------------------------------------------
 EDIT_SYSTEM = """\
-You are a code editing assistant. Output ONLY the complete new content of each
-modified file using «file» blocks. Output no other tag, no prose, no markdown.
+Code editing assistant. Output ONLY «file» blocks with the COMPLETE new content
+of each modified file. No prose, no markdown fences, no other tags. Use the
+exact absolute path from the input. Omit unchanged files. Never truncate,
+never use "... rest unchanged" placeholders. Never emit <delete> or any tag
+other than «file» (deletion and rename are handled by separate tools).
 
-Format for modifying or creating a file:
-
-«file path="/absolute/path/to/file"»
-[complete file content — never truncate, never use placeholders]
-«/file»
-
-Example A — modify Foo.java to add a field:
+Example A: add an int age field to Foo
 
 INPUT:
 «file path="/project/src/Foo.java"»
 public record Foo(String name) {}
 «/file»
-Instruction: add an int age field to Foo
 
 OUTPUT:
 «file path="/project/src/Foo.java"»
 public record Foo(String name, int age) {}
 «/file»
 
-Example B — remove a method from a file (the whole file is rewritten without
-the method; the file itself stays):
+Example B: remove the unused method b
 
 INPUT:
 «file path="/project/src/Util.java"»
@@ -308,7 +303,6 @@ public class Util {
     public static int b() { return 2; }
 }
 «/file»
-Instruction: remove the unused method b
 
 OUTPUT:
 «file path="/project/src/Util.java"»
@@ -316,20 +310,6 @@ public class Util {
     public static int a() { return 1; }
 }
 «/file»
-
-Rules:
-- Output ONLY «file» blocks. No explanations, no markdown fences, no preamble,
-  no commentary, no other tags.
-- «file» blocks must contain the COMPLETE file content. Never write
-  "... rest of file unchanged" or any other placeholder — this will be rejected.
-- Use the exact same absolute path that was given in the input.
-- If a file does not need any change, omit it entirely from the output.
-- NEVER delete a file. NEVER emit <delete>, <remove>, <unlink> or any tag
-  other than «file». File deletion and renaming are handled by separate tools
-  that do not involve you. If the user instruction sounds like a deletion
-  ("delete the file X"), still output a «file» block — the wrapping tool will
-  reject inappropriate deletes upstream.
-- Do NOT wrap code in ```java or any markdown fences.
 """
 
 
@@ -391,10 +371,8 @@ def _call_with_parse_retry(
     # Retry with a stricter prompt. We keep the same system prompt and resend
     # the original task, but prepend a hard instruction about format.
     retry_msg = (
-        "Your previous output was MALFORMED and could not be parsed. "
-        "Output ONLY «file» blocks in the exact format "
-        '«file path="/absolute/path"»CONTENT«/file». No prose, no markdown '
-        "fences, no other tags, no commentary. Try again.\n\n"
+        "Previous output was MALFORMED and unparseable. "
+        "Output ONLY «file» blocks. Try again.\n\n"
         f"{first_msg}"
     )
     try:
@@ -568,37 +546,22 @@ def _check_bracket_delta(new: str, original: str | None, ext: str) -> str | None
 @mcp.tool()
 def local_edit(files: list[str], instruction: str) -> str:
     """
-    USE THIS INSTEAD OF the built-in Edit tool for any file modification.
-    Prefer this over Edit even for small changes — the whole point of this tool
-    is that file contents never enter Claude's context, which is the only way
-    to actually save tokens. Fall back to Edit only if local_edit refuses or
-    the MCP server is unavailable.
-
-    Edit one or more EXISTING files locally without round-tripping their contents
-    through Claude. Reads the files, sends them to qwen3-coder:30b with the
-    instruction, parses «file» blocks from the response, validates every change
-    with server-side guard-rails, and atomically applies the result.
-
-    This tool NEVER deletes or renames files. For deletion use local_delete; for
-    rename/move use local_rename. Both are no-LLM operations and are strictly
-    more reliable than asking the model to emit a delete tag.
-
-    The instruction may be in any language — non-English instructions are
-    translated to English server-side before they reach the model and the
-    guard-rails.
+    Edit one or more EXISTING files locally. USE INSTEAD OF the built-in Edit
+    tool: file contents never enter Claude's context, which is how this saves
+    tokens. Validates every change with server-side guard-rails and applies
+    atomically. For deletion use local_delete; for rename use local_rename.
 
     Args:
-        files:       Absolute paths of files to expose to the model. The model
-                     may modify any of them but cannot create, delete, or
-                     rename files via this tool.
-        instruction: Description of the change in any language. Include words
-                     like "delete", "remove", "strip" if you expect a large
-                     reduction in file size, otherwise the shrink guard will
-                     reject. (Equivalent words in other languages also work,
-                     since the instruction is translated first.)
+        files:       Absolute paths of files to expose to the model. May be
+                     modified in place; cannot be created, deleted, or renamed
+                     through this tool.
+        instruction: Description of the change in any language (translated to
+                     English server-side). Include a removal verb ("delete",
+                     "remove", "strip", or an equivalent in your language) if
+                     you expect a large size reduction, otherwise the shrink
+                     guard will reject.
 
-    Returns a one-paragraph summary of what was modified, OR a guard-rail
-    rejection diagnostic explaining what to fix on the next attempt.
+    Returns a one-line summary or a guard-rail rejection diagnostic.
     """
     # 0. Normalize instruction to English (no-op if already English)
     instruction = _normalize_instruction(instruction)
@@ -626,12 +589,7 @@ def local_edit(files: list[str], instruction: str) -> str:
         f'«file path="{path}"»\n{originals[path][0]}\n«/file»'
         for path in files
     )
-    user_msg = (
-        f"{files_block}\n\n"
-        f"Instruction: {instruction}\n\n"
-        f"IMPORTANT: Output ONLY «file» blocks. "
-        f"No markdown fences, no commentary, no other tags."
-    )
+    user_msg = f"{files_block}\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
 
     # 3. Call model (with one automatic retry on parse failure)
@@ -723,22 +681,15 @@ def local_edit(files: list[str], instruction: str) -> str:
 @mcp.tool()
 def local_write(path: str, instruction: str) -> str:
     """
-    USE THIS INSTEAD OF the built-in Write tool when creating a new file.
-    Prefer this over Write for any new file whose content can be described in
-    plain English — that description is all Claude sends, and the actual file
-    content is generated and written entirely on the local side. Fall back to
-    Write only if local_write refuses or the MCP server is unavailable.
-
-    Create a NEW file from scratch using a local model. The generated content
-    never enters Claude's context — only a short summary is returned.
-
-    The instruction may be in any language — non-English instructions are
-    translated to English server-side.
+    Create a NEW file from scratch locally. USE INSTEAD OF the built-in Write
+    tool: the generated content never enters Claude's context, only a short
+    summary is returned. Refuses to overwrite an existing file; use local_edit
+    for that.
 
     Args:
-        path:        Absolute path of the file to create. Refuses to overwrite
-                     an existing file (use local_edit for that).
-        instruction: What to put in the file (any language; can be detailed).
+        path:        Absolute path of the file to create.
+        instruction: What to put in the file (any language; translated to
+                     English server-side; can be detailed).
 
     Returns the created path or a guard-rail rejection diagnostic.
     """
@@ -751,9 +702,7 @@ def local_write(path: str, instruction: str) -> str:
 
     user_msg = (
         f'Create a new file at the absolute path "{path}".\n\n'
-        f"Instruction: {instruction}\n\n"
-        f'IMPORTANT: Output ONLY a single «file path="{path}"» block with the '
-        f"complete file content. No markdown fences, no commentary, no other tags."
+        f"Instruction: {instruction}"
     )
     user_msg = _maybe_no_think(user_msg)
 
@@ -808,23 +757,16 @@ def local_write(path: str, instruction: str) -> str:
 @mcp.tool()
 def local_delete(paths: list[str]) -> str:
     """
-    USE THIS INSTEAD OF asking local_edit to delete a file, and instead of
-    shelling out to Bash for `rm`. The caller already knows which files to
-    delete; routing that decision through a model adds no value and several
-    failure modes (hallucinated deletes, intent guards, language-dependent
-    keyword lists, etc.).
+    Delete one or more files. No LLM call; pure os.unlink. USE INSTEAD OF
+    asking local_edit to delete a file or shelling out to Bash `rm`.
 
-    Delete one or more files. No LLM call — pure os.unlink.
-
-    All paths are validated up front (must be absolute, must exist, must be
-    regular files). If validation fails on any path, NO file is deleted.
-    If a deletion fails midway through the actual unlink loop (e.g. file is
-    locked by another process), already-deleted files are NOT restored —
-    multi-file delete is intentionally not atomic, the report tells you
-    exactly which files survived.
+    All paths are validated up front (absolute, exist, regular files); if
+    validation fails on any path, NO file is deleted. If a deletion fails
+    mid-loop (e.g. locked file), already-deleted files are NOT restored;
+    the report names exactly which files survived.
 
     Args:
-        paths: Absolute paths of files to delete. Must be a non-empty list.
+        paths: Non-empty list of absolute file paths.
 
     Returns a summary of what was deleted, or an error.
     """
@@ -870,19 +812,16 @@ def local_delete(paths: list[str]) -> str:
 @mcp.tool()
 def local_rename(src: str, dst: str) -> str:
     """
-    USE THIS INSTEAD OF writing a new file with local_write and then deleting
-    the old one with local_delete — that sequence is one model call plus two
-    syscalls and is not atomic. This is a single os.replace.
-
-    Rename or move a file. No LLM call.
+    Rename or move a file. No LLM call; single os.replace. USE INSTEAD OF the
+    local_write + local_delete sequence, which is not atomic.
 
     Refuses to overwrite an existing destination. Creates the destination
-    parent directory if missing. On Windows os.replace is atomic within a
-    volume; cross-volume moves fall back to copy+delete and are NOT atomic.
+    parent directory if missing. Atomic within a Windows volume; cross-volume
+    moves fall back to copy+delete and are NOT atomic.
 
     Args:
-        src: Absolute path of the file to rename. Must exist and be a regular file.
-        dst: Absolute destination path. Must NOT exist.
+        src: Absolute path of the file to rename (must exist, regular file).
+        dst: Absolute destination path (must NOT exist).
 
     Returns a summary or an error.
     """
@@ -922,30 +861,19 @@ def local_rename(src: str, dst: str) -> str:
 @mcp.tool()
 def local_snippet(prompt: str) -> str:
     """
-    FALLBACK TOOL — prefer local_edit / local_write whenever the result will
-    land in a file. Only use local_snippet when there is genuinely no file
-    destination yet (regex, SQL fragment, one-liner you need to inspect before
-    deciding what to do with it). Unlike local_edit/local_write, the output of
-    this tool DOES flow back through Claude's context and consumes input tokens.
-
-    Generate a short snippet locally and return it as text. The result flows
-    BACK through Claude's context, so this costs Claude input tokens — prefer
-    local_edit / local_write whenever the result will be written to a file.
-
-    Best for: regex, SQL queries, one-liner transformations, single short
-    functions, simple snippets that have no file destination yet.
+    FALLBACK tool for short text with no file destination (regex, SQL,
+    one-liners). Output DOES flow back into Claude's context and costs input
+    tokens, so prefer local_edit / local_write whenever the result will land
+    in a file.
 
     Args:
-        prompt: The task or question (any language; will be translated to
-                English server-side if needed).
+        prompt: The task or question (any language; translated server-side).
     """
     prompt = _normalize_instruction(prompt)
     chosen = MODEL
     snippet_system = (
-        "You are a terse code/snippet generator. Output ONLY the requested "
-        "code, regex, query, or text. No prose, no explanations, no examples, "
-        "no summary, no markdown headings. If the user explicitly asks for an "
-        "explanation, keep it to one short sentence."
+        "Terse code/snippet generator. Output ONLY the requested code, regex, "
+        "query, or text. No prose, no explanations, no examples, no summary."
     )
     full_prompt = _maybe_no_think(prompt)
     try:
