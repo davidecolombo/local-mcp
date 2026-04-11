@@ -6,5 +6,5 @@
   "snippet_num_predict": 1024,
   "translate_ctx": 2048,
   "translate_num_predict": 512,
-  "timeout": 600
+  "timeout": 120
 }

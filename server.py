@@ -168,16 +168,32 @@ def _call_ollama(
     payload: dict = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": True,
         # Pin the model in VRAM forever — single-model architecture, no eviction.
         "keep_alive": -1,
         "options": options,
     }
     if system:
         payload["system"] = system
-    resp = httpx.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
+    # Streaming: timeout applies per-chunk, not to the whole response.
+    # This avoids false timeouts when the model outputs a large file; as long
+    # as the model keeps producing tokens the connection stays alive.
+    chunks: list[str] = []
+    with httpx.stream("POST", OLLAMA_URL, json=payload, timeout=TIMEOUT) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = data.get("message", {}).get("content", "")
+            if content:
+                chunks.append(content)
+            if data.get("done", False):
+                break
+    return "".join(chunks)
 
 
 def _strip_think_tags(text: str) -> str:
