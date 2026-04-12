@@ -287,9 +287,10 @@ def _call_openrouter(
                 data = json.loads(payload_str)
             except json.JSONDecodeError:
                 continue
+            choices = data.get("choices") or []
             content = (
-                data.get("choices", [{}])[0].get("delta", {}).get("content") or ""
-            )
+                choices[0].get("delta", {}).get("content") or ""
+            ) if choices else ""
             if content:
                 chunks.append(content)
     return "".join(chunks)
@@ -440,6 +441,13 @@ public class Util {
 «/file»
 """
 
+READ_SYSTEM = """\
+File analysis assistant. You receive one or more files and an analysis instruction.
+Read the files carefully and respond with your analysis as plain text.
+Do NOT output «file» blocks or code fences unless the instruction specifically
+asks for code. Focus on answering the question or performing the analysis requested.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Output parsing
@@ -488,7 +496,7 @@ def _call_with_parse_retry(
         raw = _call_model(
             MODEL, [{"role": "user", "content": first_msg}], system=EDIT_SYSTEM
         )
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return None, f"Model call failed: {e}"
     raw = _strip_think_tags(raw)
 
@@ -507,7 +515,7 @@ def _call_with_parse_retry(
         raw = _call_model(
             MODEL, [{"role": "user", "content": retry_msg}], system=EDIT_SYSTEM
         )
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return None, f"Model call failed on retry: {e}"
     raw = _strip_think_tags(raw)
 
@@ -1025,6 +1033,56 @@ def local_snippet(prompt: str) -> str:
     except httpx.HTTPError as e:
         return f"[{chosen}] Model call failed: {e}"
     return _strip_think_tags(raw)
+
+
+# ---------------------------------------------------------------------------
+# local_read
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def local_read(files: list[str], instruction: str) -> str:
+    """
+    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
+
+    Read one or more files via the local model and return its analysis as text.
+    Files are NEVER modified. Use this for summarization, code review, finding
+    patterns, or any read-only analysis. Output flows back into Claude's
+    context (costs input tokens on the next turn), so keep instructions
+    focused to get concise answers.
+
+    Args:
+        files:       Absolute paths of files to send to the local model.
+        instruction: What to analyze or summarize (any language; translated
+                     server-side).
+    """
+    instruction = _normalize_instruction(instruction)
+
+    file_blocks: list[str] = []
+    for raw_path in files:
+        p = Path(raw_path)
+        if not p.exists():
+            return f"Error: file not found: {raw_path}"
+        if not p.is_file():
+            return f"Error: not a regular file: {raw_path}"
+        try:
+            lf, _eol, _raw = _read_file(p)
+        except OSError as e:
+            return f"Error reading {raw_path}: {e}"
+        file_blocks.append(f'«file path="{raw_path}"»\n{lf}\n«/file»')
+
+    user_msg = "\n\n".join(file_blocks) + f"\n\nInstruction: {instruction}"
+    user_msg = _maybe_no_think(user_msg)
+
+    chosen = MODEL
+    try:
+        raw = _call_model(
+            chosen,
+            [{"role": "user", "content": user_msg}],
+            system=READ_SYSTEM,
+            num_ctx=EDIT_CTX,
+        )
+    except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
+        return f"[{chosen}] Model call failed: {e}"
+    return f"[{chosen}] {_strip_think_tags(raw)}"
 
 
 if __name__ == "__main__":

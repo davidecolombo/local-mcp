@@ -47,54 +47,20 @@ $EndMarker    = '<!-- END local-mcp -->'
 
 $ClaudeMdBlock = @"
 $BeginMarker
-## Use of the local-mcp server
+## local-mcp tools
 
-For file operations, use the tools from the ``local-mcp`` server:
-- ``local_edit`` instead of ``Edit`` (modifying existing files in place; always a token win)
-- ``local_write`` for NEW files ONLY when a concise instruction expands into a much larger file: stubs, boilerplate, scaffolds, config templates. If you would dictate content line-by-line, use the built-in ``Write`` instead -- the local model round-trip adds overhead without saving tokens.
-- ``local_delete`` instead of ``Bash rm`` (deleting files; no model call)
-- ``local_rename`` instead of ``Bash mv`` (rename / move; no model call, atomic within a volume)
-- ``local_snippet`` only as a fallback for snippets with no file destination
+Use ``local-mcp`` tools instead of built-ins for file operations. File contents stay server-side; Claude only sees short summaries. Instructions can be in any language (translated server-side).
 
-Break-even rule for ``local_write``: savings only occur when ``len(instruction) << len(file)``. When you already know the exact content -- copied pattern, specific function bodies, precise config values -- use ``Write``; same token cost without the extra round-trip.
+| Task | Tool | Notes |
+|------|------|-------|
+| Edit existing files | ``local_edit`` | Always prefer over ``Edit`` (denied via settings). |
+| Create new files | ``local_write`` | Only when instruction is much shorter than the output (stubs, scaffolds, boilerplate). Use ``Write`` for dictated content. |
+| Analyze / summarize files | ``local_read`` | Read-only; returns analysis text. Good for code review, pattern search, improvement plans. |
+| Delete files | ``local_delete`` | Pure syscall, no model call. Use instead of ``Bash rm``. |
+| Rename / move files | ``local_rename`` | Pure syscall, atomic. Use instead of ``Bash mv``. |
+| Short snippets (no file dest) | ``local_snippet`` | Output costs Claude tokens. Use sparingly. |
 
-Reason: for ``local_edit`` the file contents never pass through Claude's context (diffs compress well), and ``local_delete`` / ``local_rename`` are pure syscalls. The built-in ``Edit`` tool is denied via ``.claude/settings.json``; ``Write`` remains available for the cases above.
-
-### Instructions can be in any language
-
-The instruction strings to ``local_edit``, ``local_write``, and
-``local_snippet`` may be written in any language (Italian, French, Spanish,
-German, etc.). Non-English instructions are detected and translated to
-English server-side before they reach the model and the guard-rails. Do NOT
-translate instructions yourself before calling these tools -- it wastes
-output tokens for no benefit.
-
-### Trust the tools, do not re-read files to verify
-
-All ``local-mcp`` tools are transactional and report success or a structured
-error in their return value. ``local_edit`` runs guard-rails server-side,
-writes atomically, and reverts every successful write from captured original
-bytes if any write in the batch fails. ``local_delete`` validates every path
-up front before touching anything. ``local_rename`` is a single atomic
-``os.replace`` within a volume.
-
-When the summary begins with ``[qwen3-coder:30b]`` (for ``local_edit`` /
-``local_write``) or starts with ``Deleted`` / ``Renamed`` (for
-``local_delete`` / ``local_rename``) and lists the affected files, trust it
-and move on. Do NOT ``Read``, ``Glob``, or ``Bash ls`` the filesystem
-afterwards to "verify"; that defeats the token-saving goal. Read a file
-ONLY when:
-- the tool returned a line starting with ``REJECTED``, ``Error``, or ``Partial failure``, or
-- you genuinely need the current contents for a subsequent, unrelated step.
-
-### Deleting and renaming files
-
-``local_edit`` never deletes or renames files -- it can only modify content
-in place. For whole-file deletion call ``local_delete([path, ...])``; for
-rename or move call ``local_rename(src, dst)``. Both are pure syscalls
-(no LLM involvement) and are strictly more reliable than asking a model to
-emit a delete tag. Do NOT use ``Bash`` with ``rm`` / ``mv`` / ``del`` /
-``move`` for file operations -- those bypass the MCP layer entirely.
+**Trust tool results.** All writes are atomic with guard-rails; all deletes validate paths up front. Do not re-read files to verify unless the tool returned ``REJECTED``, ``Error``, or ``Partial failure``. Do not use ``Bash`` for ``rm`` / ``mv`` / ``del`` / ``move``; those bypass the MCP layer.
 $EndMarker
 "@
 
