@@ -86,7 +86,7 @@ cp configs/qwen3-coder-30b.json model-config.json
 |----------|-------|-------|
 | `configs/qwen3-coder-30b.json` | `qwen3-coder:30b` | Default. MoE 30B, ~3B active. Best tested option. |
 | `configs/devstral-small-2-24b.json` | `devstral-small-2:24b` | Mistral's code-agent model. Trained for structured output. Lower timeout (10 min). |
-| `configs/qwen3-30b.json` | `qwen3:30b` | Base Qwen3 (non-Coder). Same MoE architecture, broader training. |
+| `configs/qwen3-coder-480b-free.json` | `qwen/qwen3-coder:free` | Qwen3-Coder 480B A35B via OpenRouter free tier; requires `OPENROUTER_API_KEY`; subject to rate limits. |
 | `configs/openrouter-free.json` | `openrouter/free` | Remote via OpenRouter free-models router; requires `OPENROUTER_API_KEY` env var; model choice is non-deterministic per call. |
 
 ### Config fields
@@ -105,7 +105,7 @@ cp configs/qwen3-coder-30b.json model-config.json
 | `snippet_num_predict` | int | `1024` | Max output tokens for snippets |
 | `translate_ctx` | int | `2048` | Context window for translation pre-pass (Ollama only) |
 | `translate_num_predict` | int | `512` | Max output tokens for translation |
-| `timeout` | int | `1200` | HTTP timeout in seconds |
+| `timeout` | int | `1200` | HTTP timeout in seconds. For Ollama (streaming): max time between received chunks. For OpenRouter (non-streaming): max total time to receive the complete response. |
 
 ### Custom config example
 

@@ -243,7 +243,7 @@ def _call_openrouter(
     num_ctx: int | None = None,       # accepted but ignored; OpenRouter decides context
     num_predict: int | None = None,   # -> max_tokens
 ) -> str:
-    """Call an OpenAI-compatible remote endpoint (OpenRouter) with SSE streaming."""
+    """Call an OpenAI-compatible remote endpoint (OpenRouter), non-streaming."""
     full_messages: list[dict] = []
     if system:
         full_messages.append({"role": "system", "content": system})
@@ -252,7 +252,7 @@ def _call_openrouter(
     payload: dict = {
         "model": model,
         "messages": full_messages,
-        "stream": True,
+        "stream": False,
     }
     if num_predict is not None:
         payload["max_tokens"] = num_predict
@@ -266,34 +266,28 @@ def _call_openrouter(
         "X-Title": OPENROUTER_TITLE,
     }
 
-    chunks: list[str] = []
-    with httpx.stream(
-        "POST", OPENROUTER_URL, json=payload, headers=headers, timeout=TIMEOUT
-    ) as resp:
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            body = e.response.text[:400]
-            raise httpx.HTTPError(
-                f"OpenRouter returned {e.response.status_code}: {body}"
-            ) from e
-        for line in resp.iter_lines():
-            if not line or not line.startswith("data: "):
-                continue
-            payload_str = line[len("data: "):]
-            if payload_str.strip() == "[DONE]":
-                break
-            try:
-                data = json.loads(payload_str)
-            except json.JSONDecodeError:
-                continue
-            choices = data.get("choices") or []
-            content = (
-                choices[0].get("delta", {}).get("content") or ""
-            ) if choices else ""
-            if content:
-                chunks.append(content)
-    return "".join(chunks)
+    try:
+        resp = httpx.post(
+            OPENROUTER_URL, json=payload, headers=headers, timeout=TIMEOUT
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        body = e.response.text[:400]
+        raise httpx.HTTPError(
+            f"OpenRouter returned {e.response.status_code}: {body}"
+        ) from e
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise httpx.HTTPError(f"OpenRouter response is not valid JSON: {e}") from e
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise httpx.HTTPError(
+            f"OpenRouter returned no choices. Response: {resp.text[:400]}"
+        )
+    return choices[0].get("message", {}).get("content") or ""
 
 
 def _call_model(
@@ -677,6 +671,56 @@ def _check_bracket_delta(new: str, original: str | None, ext: str) -> str | None
 
 
 # ---------------------------------------------------------------------------
+# local_read
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def local_read(files: list[str], instruction: str) -> str:
+    """
+    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
+
+    Read one or more files via the local model and return its analysis as text.
+    Files are NEVER modified. Use this for summarization, code review, finding
+    patterns, or any read-only analysis. Output flows back into Claude's
+    context (costs input tokens on the next turn), so keep instructions
+    focused to get concise answers.
+
+    Args:
+        files:       Absolute paths of files to send to the local model.
+        instruction: What to analyze or summarize (any language; translated
+                     server-side).
+    """
+    instruction = _normalize_instruction(instruction)
+
+    file_blocks: list[str] = []
+    for raw_path in files:
+        p = Path(raw_path)
+        if not p.exists():
+            return f"Error: file not found: {raw_path}"
+        if not p.is_file():
+            return f"Error: not a regular file: {raw_path}"
+        try:
+            lf, _eol, _raw = _read_file(p)
+        except OSError as e:
+            return f"Error reading {raw_path}: {e}"
+        file_blocks.append(f'«file path="{raw_path}"»\n{lf}\n«/file»')
+
+    user_msg = "\n\n".join(file_blocks) + f"\n\nInstruction: {instruction}"
+    user_msg = _maybe_no_think(user_msg)
+
+    chosen = MODEL
+    try:
+        raw = _call_model(
+            chosen,
+            [{"role": "user", "content": user_msg}],
+            system=READ_SYSTEM,
+            num_ctx=EDIT_CTX,
+        )
+    except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
+        return f"[{chosen}] Model call failed: {e}"
+    return f"[{chosen}] {_strip_think_tags(raw)}"
+
+
+# ---------------------------------------------------------------------------
 # local_edit
 # ---------------------------------------------------------------------------
 @mcp.tool()
@@ -1033,56 +1077,6 @@ def local_snippet(prompt: str) -> str:
     except httpx.HTTPError as e:
         return f"[{chosen}] Model call failed: {e}"
     return _strip_think_tags(raw)
-
-
-# ---------------------------------------------------------------------------
-# local_read
-# ---------------------------------------------------------------------------
-@mcp.tool()
-def local_read(files: list[str], instruction: str) -> str:
-    """
-    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
-
-    Read one or more files via the local model and return its analysis as text.
-    Files are NEVER modified. Use this for summarization, code review, finding
-    patterns, or any read-only analysis. Output flows back into Claude's
-    context (costs input tokens on the next turn), so keep instructions
-    focused to get concise answers.
-
-    Args:
-        files:       Absolute paths of files to send to the local model.
-        instruction: What to analyze or summarize (any language; translated
-                     server-side).
-    """
-    instruction = _normalize_instruction(instruction)
-
-    file_blocks: list[str] = []
-    for raw_path in files:
-        p = Path(raw_path)
-        if not p.exists():
-            return f"Error: file not found: {raw_path}"
-        if not p.is_file():
-            return f"Error: not a regular file: {raw_path}"
-        try:
-            lf, _eol, _raw = _read_file(p)
-        except OSError as e:
-            return f"Error reading {raw_path}: {e}"
-        file_blocks.append(f'«file path="{raw_path}"»\n{lf}\n«/file»')
-
-    user_msg = "\n\n".join(file_blocks) + f"\n\nInstruction: {instruction}"
-    user_msg = _maybe_no_think(user_msg)
-
-    chosen = MODEL
-    try:
-        raw = _call_model(
-            chosen,
-            [{"role": "user", "content": user_msg}],
-            system=READ_SYSTEM,
-            num_ctx=EDIT_CTX,
-        )
-    except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
-        return f"[{chosen}] Model call failed: {e}"
-    return f"[{chosen}] {_strip_think_tags(raw)}"
 
 
 if __name__ == "__main__":
