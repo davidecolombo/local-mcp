@@ -6,7 +6,7 @@ MCP server that delegates implementation work to local Ollama models so Claude (
 
 The big savings come from **never round-tripping file contents through Claude's context**:
 
-- `local_edit` reads and writes existing files on the MCP side. Claude sends a short diff-shaped instruction and gets back a one-line summary. **This is an unconditional token win; always prefer it over the built-in `Edit`.**
+- `local_edit` reads and writes existing files on the MCP side. Claude sends a short instruction and gets back a one-line summary. **Best when Claude has not yet read the file into context** (avoids both the read and write token cost) **or when the change spans many lines / multiple files.** When Claude already has the file in context and the edit is small or surgical, the built-in `Edit` (which sends only a diff) is cheaper and more reliable; no external model call means no risk of block-format failures.
 - `local_write` creates new files the same way, but savings are conditional: the instruction must be much shorter than the file it produces. Good fits: stubs, boilerplate, scaffolds, config templates (short spec, large output). Bad fit: dictating exact content line-by-line; in that case the instruction approaches the file size and the local-model round-trip adds overhead for no gain. Use the built-in `Write` for dictated content.
 - `local_read` sends files to the local model for analysis and returns the result as text. Files are never modified. Good for: summarization, code review, finding patterns, populating improvement plans. Output flows back into Claude's context (same cost profile as `local_snippet`), so keep instructions focused to get concise answers.
 - `local_delete` and `local_rename` are pure filesystem operations; no model call at all. They exist so the caller never has to ask the model to decide *whether* to delete or move a file; the caller already knows.
@@ -294,11 +294,11 @@ Should return a JSON list of installed models including your configured model.
 
 The server is registered at user scope and works in every project automatically. No per-project configuration needed *to make the tools available*.
 
-However, **Claude will not automatically prefer the MCP tools over its built-in `Edit` / `Write`**; that is a model decision, and the built-ins usually win unless we forbid them. To actually realise the token savings on a given project, run the per-project setup script below.
+However, **Claude will not automatically prefer the MCP tools over its built-ins**; that is a model decision. To guide Claude toward the right tool at the right time, run the per-project setup script below.
 
-### Per-project setup: forcing the delegation
+### Per-project setup: routing guidance
 
-`Setup-Project.ps1` configures a project so Claude *must* use `local_edit` / `local_write` for file changes (it bans the built-in `Edit` / `Write` tools via `permissions.deny`, and adds a guidance section to `CLAUDE.md` explaining why).
+`Setup-Project.ps1` adds a guidance section to `CLAUDE.md` that tells Claude when to use `local_edit` vs the built-in `Edit`, when to use `local_write` vs `Write`, etc. The routing logic is context-aware: prefer `local_edit` when files are not yet in Claude's context; prefer `Edit` for small surgical changes on files Claude has already read.
 
 ```powershell
 # In the project root you want to configure:
@@ -313,11 +313,11 @@ However, **Claude will not automatically prefer the MCP tools over its built-in 
 
 What it does (idempotent; safe to re-run):
 
-1. Creates `<project>\.claude\settings.json` if missing, or merges into the existing one. Adds `"Edit"` and `"Write"` to `permissions.deny`. Other keys (`env`, `allow`, other `deny` entries, etc.) are preserved.
+1. Creates `<project>\.claude\settings.json` if missing, or merges into the existing one. Cleans up any stale deny entries from older versions of this script (earlier versions denied `Edit` and `Write`; the current version denies neither).
 2. Creates `<project>\CLAUDE.md` if missing, or appends to it. The guidance block is delimited by `<!-- BEGIN local-mcp -->` / `<!-- END local-mcp -->` markers, so re-running replaces the block in place rather than duplicating it.
-3. With `-Remove`: pulls `Edit`/`Write` back out of the deny array, and strips the marker block from `CLAUDE.md`. Empty files (created from scratch by the setup) are deleted; files with other content are preserved.
+3. With `-Remove`: strips the marker block from `CLAUDE.md` and removes any managed deny entries from settings. Empty files (created from scratch by the setup) are deleted; files with other content are preserved.
 
-After running the script, **restart Claude Code in that project** for the new settings to take effect. Then in a new session, ask Claude to make a non-trivial edit; it will be forced to call `local_edit`, and the result will carry the `[<model>]` prefix (e.g. `[qwen3-coder:30b]`) instead of going through the built-in `Edit` tool.
+After running the script, **restart Claude Code in that project** for the new settings to take effect. Both `Edit` and `local_edit` will be available; the CLAUDE.md guidance tells Claude when to use each one.
 
 PowerShell 5.1 (default on Windows 10) is supported. No external dependencies.
 
