@@ -50,7 +50,7 @@ import json
 import os
 import re
 import tempfile
-import threading
+import concurrent.futures
 from pathlib import Path
 
 import httpx
@@ -65,7 +65,7 @@ mcp = FastMCP("local-mcp")
 _CONFIG_DEFAULTS: dict = {
     # Provider: "ollama" (default, local) or "openrouter" (remote, OpenAI-compat).
     "provider": "ollama",
-    "model": "qwen3-coder:30b",
+    "model": "gemma4:e4b",
     # Ollama-specific
     "ollama_url": "http://localhost:11434/api/chat",
     # OpenRouter-specific (ignored when provider="ollama")
@@ -129,10 +129,10 @@ if PROVIDER == "openrouter":
 else:
     _OPENROUTER_API_KEY = ""
 
-# One GPU, one request at a time. Non-blocking: callers get an immediate
-# error rather than queueing behind a long-running generation.
-# Only acquired by _call_ollama; _call_openrouter does not need it.
-_OLLAMA_LOCK = threading.Lock()
+# One GPU, one request at a time. Requests are queued FIFO by a single-worker
+# executor so parallel agents wait rather than fail. _call_openrouter does not
+# need this because it is a remote endpoint with no GPU contention.
+_OLLAMA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 # Qwen3-specific: /no_think suppresses the reasoning chain, and a defensive
 # stripper catches any <think> tags that leak through.
@@ -185,13 +185,14 @@ PARSE_FAIL_ECHO_LIMIT = 600
 # ---------------------------------------------------------------------------
 # Ollama client
 # ---------------------------------------------------------------------------
-def _call_ollama(
+def _call_ollama_impl(
     model: str,
     messages: list[dict],
-    system: str | None = None,
-    num_ctx: int | None = None,
-    num_predict: int | None = None,
+    system: str | None,
+    num_ctx: int | None,
+    num_predict: int | None,
 ) -> str:
+    """HTTP call to Ollama. Runs inside the single-worker executor."""
     options: dict = {"num_ctx": num_ctx if num_ctx is not None else EDIT_CTX}
     if num_predict is not None:
         options["num_predict"] = num_predict
@@ -208,32 +209,47 @@ def _call_ollama(
     # Streaming: timeout applies per-chunk, not to the whole response.
     # This avoids false timeouts when the model outputs a large file; as long
     # as the model keeps producing tokens the connection stays alive.
-    # Non-blocking lock: if another call is already running, fail immediately
-    # rather than queueing (a queued call would time out behind a long generation).
-    if not _OLLAMA_LOCK.acquire(blocking=False):
-        raise httpx.HTTPError(
-            "Ollama busy: another local_* call is in progress. "
-            "Retry this call sequentially after the current one completes."
-        )
+    chunks: list[str] = []
+    with httpx.stream("POST", OLLAMA_URL, json=payload, timeout=TIMEOUT) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = data.get("message", {}).get("content", "")
+            if content:
+                chunks.append(content)
+            if data.get("done", False):
+                break
+    return "".join(chunks)
+
+
+def _call_ollama(
+    model: str,
+    messages: list[dict],
+    system: str | None = None,
+    num_ctx: int | None = None,
+    num_predict: int | None = None,
+) -> str:
+    """Submit an Ollama call to the single-worker queue and wait for the result.
+
+    Parallel callers (e.g. agents) are queued FIFO and processed sequentially.
+    A 300 s wait-timeout guards against a stalled GPU.
+    """
+    future = _OLLAMA_EXECUTOR.submit(
+        _call_ollama_impl, model, messages, system, num_ctx, num_predict
+    )
     try:
-        chunks: list[str] = []
-        with httpx.stream("POST", OLLAMA_URL, json=payload, timeout=TIMEOUT) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                content = data.get("message", {}).get("content", "")
-                if content:
-                    chunks.append(content)
-                if data.get("done", False):
-                    break
-        return "".join(chunks)
-    finally:
-        _OLLAMA_LOCK.release()
+        return future.result(timeout=300)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise httpx.HTTPError(
+            "Ollama busy: timed out after 300 s waiting in queue. "
+            "The GPU may be stalled."
+        )
 
 
 def _call_openrouter(
