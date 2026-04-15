@@ -153,6 +153,17 @@ REMOVAL_KEYWORDS = (
     "erase", "purge", "discard",
 )
 
+# Patterns that indicate the caller wants the file echoed verbatim rather than
+# analyzed. local_read is an analysis tool; verbatim retrieval belongs to the
+# built-in Read tool. Checked after language normalization so translation is
+# already in English.
+_RETRIEVAL_RE = re.compile(
+    r"\b(verbatim|word[\s\-]for[\s\-]word|every\s+line"
+    r"|full\s+content|entire\s+content|complete\s+content"
+    r"|exact\s+content|in\s+its\s+entirety)\b",
+    re.IGNORECASE,
+)
+
 # Lazy-output markers — matched as WHOLE TRIMMED LINES, and only flagged when
 # the same line was NOT already present in the original file. Whole-line +
 # delta-against-original keeps false positives near zero.
@@ -692,20 +703,29 @@ def _check_bracket_delta(new: str, original: str | None, ext: str) -> str | None
 @mcp.tool()
 def local_read(files: list[str], instruction: str) -> str:
     """
-    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
+    Analyze one or more files via the local model and return analysis as text.
+    Files are NEVER modified. Use for: summarization, code review, pattern
+    search, improvement plans. Output flows back into Claude's context (costs
+    input tokens), so keep instructions focused for concise answers.
 
-    Read one or more files via the local model and return its analysis as text.
-    Files are NEVER modified. Use this for summarization, code review, finding
-    patterns, or any read-only analysis. Output flows back into Claude's
-    context (costs input tokens on the next turn), so keep instructions
-    focused to get concise answers.
+    NEVER use to retrieve verbatim file content — use the built-in Read tool
+    for that. Verbatim retrieval returns the full file into Claude's context,
+    defeating the token-saving purpose and adding an unnecessary model round-trip.
 
     Args:
         files:       Absolute paths of files to send to the local model.
         instruction: What to analyze or summarize (any language; translated
-                     server-side).
+                     server-side). Must be an analysis task, not a retrieval request.
     """
     instruction = _normalize_instruction(instruction)
+
+    if _RETRIEVAL_RE.search(instruction):
+        return (
+            "Error: local_read cannot be used for verbatim file retrieval. "
+            "Use the built-in Read tool instead — it reads the file directly "
+            "into context without a local-model round-trip. "
+            "local_read is for analysis tasks (summarize, review, find patterns)."
+        )
 
     file_blocks: list[str] = []
     for raw_path in files:

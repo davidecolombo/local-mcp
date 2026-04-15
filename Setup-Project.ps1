@@ -60,7 +60,7 @@ Route file operations to save tokens. With local-mcp tools, file contents stay s
 | Edit (file not in context) | ``local_edit`` | Sends paths + instruction; file never enters Claude context. |
 | Edit (file in context / small fix) | ``Edit`` | Diff-only; cheaper and more reliable than an external model call. |
 | Create new files | ``local_write`` | Only when instruction is much shorter than the output. Use ``Write`` for dictated content. |
-| Analyze / summarize files | ``local_read`` | Read-only; returns analysis text. Good for code review, pattern search. |
+| Analyze / summarize files | ``local_read`` | Read-only; returns analysis text. Good for code review, pattern search. NEVER use to retrieve verbatim content — use ``Read`` for that. |
 | Delete files | ``local_delete`` | Pure syscall, no model call. Use instead of ``Bash rm``. |
 | Rename / move files | ``local_rename`` | Pure syscall, atomic. Use instead of ``Bash mv``. |
 | Short snippets (no file dest) | ``local_snippet`` | Output costs Claude tokens. Use sparingly. |
