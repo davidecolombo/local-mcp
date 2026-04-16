@@ -605,6 +605,38 @@ def _atomic_write(target: Path, content: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Input-size guard — pre-model-call validation
+# ---------------------------------------------------------------------------
+# Conservative character-per-token ratio. Code typically runs 3-4 chars/token;
+# using 3 over-estimates token usage, providing a safety margin.
+_CHARS_PER_TOKEN = 3
+
+# Budget reserved for the system prompt, instruction text, and framing.
+# EDIT_SYSTEM ~250 tokens, READ_SYSTEM ~80 tokens, instruction up to 200 tokens;
+# 512 covers all cases with headroom.
+_PROMPT_OVERHEAD_TOKENS = 512
+
+
+def _check_input_size(content: str, ctx_limit: int, label: str) -> str | None:
+    """
+    Estimate the token count of *content* and reject if it would exceed
+    ctx_limit minus the reserved overhead budget.
+
+    Returns None if the size is acceptable, or a human-readable error string
+    if the content is too large to send to the model safely.
+    """
+    available = ctx_limit - _PROMPT_OVERHEAD_TOKENS
+    estimated_tokens = len(content) // _CHARS_PER_TOKEN
+    if estimated_tokens > available:
+        return (
+            f"Error: {label} is too large for the configured edit_ctx={ctx_limit} tokens "
+            f"(estimated ~{estimated_tokens} tokens; limit after overhead is {available}). "
+            "Use the built-in Read or Edit tool for this file."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Guard-rails — pre-write validation
 # ---------------------------------------------------------------------------
 def _instruction_allows_shrink(instruction: str) -> bool:
@@ -743,6 +775,10 @@ def local_read(files: list[str], instruction: str) -> str:
     user_msg = "\n\n".join(file_blocks) + f"\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
 
+    size_err = _check_input_size(user_msg, EDIT_CTX, f"{len(files)} file(s)")
+    if size_err:
+        return size_err
+
     chosen = MODEL
     try:
         raw = _call_model(
@@ -809,6 +845,10 @@ def local_edit(files: list[str], instruction: str) -> str:
     )
     user_msg = f"{files_block}\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
+
+    size_err = _check_input_size(user_msg, EDIT_CTX, f"{len(files)} file(s)")
+    if size_err:
+        return size_err
 
     # 3. Call model (with one automatic retry on parse failure)
     file_changes_raw, err = _call_with_parse_retry(user_msg, files)
