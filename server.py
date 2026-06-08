@@ -48,6 +48,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import concurrent.futures
 from pathlib import Path
 
@@ -92,6 +93,10 @@ _CONFIG_DEFAULTS: dict = {
     "seed": None,
     "num_gpu": None,
     "timeout": 1200,
+    # Seconds to wait in the single-worker FIFO queue before giving up. Bounds
+    # ONLY the wait to start, not generation; once a call begins streaming,
+    # the per-chunk `timeout` above governs it. (Task-004)
+    "queue_timeout": 300,
 }
 
 
@@ -141,6 +146,7 @@ TOP_K                      = _cfg["top_k"]
 SEED                       = _cfg["seed"]
 NUM_GPU                    = _cfg["num_gpu"]
 TIMEOUT: int               = _cfg["timeout"]
+QUEUE_TIMEOUT: int         = _cfg["queue_timeout"]
 
 if PROVIDER == "openrouter":
     _OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
@@ -292,19 +298,30 @@ def _call_ollama(
     """Submit an Ollama call to the single-worker queue and wait for the result.
 
     Parallel callers (e.g. agents) are queued FIFO and processed sequentially.
-    A 300 s wait-timeout guards against a stalled GPU.
+    QUEUE_TIMEOUT bounds ONLY the time spent waiting to start, not generation:
+    once a call begins streaming, execution is governed by the per-chunk httpx
+    timeout (TIMEOUT) inside _call_ollama_impl, so a long but healthy generation
+    is never killed by a wall-clock cap. (Task-004)
     """
-    future = _OLLAMA_EXECUTOR.submit(
-        _call_ollama_impl, model, messages, system, num_ctx, num_predict, temperature
-    )
-    try:
-        return future.result(timeout=300)
-    except concurrent.futures.TimeoutError:
+    started = threading.Event()
+
+    def _job() -> str:
+        started.set()  # set the moment the worker picks this up, before the HTTP call
+        return _call_ollama_impl(
+            model, messages, system, num_ctx, num_predict, temperature
+        )
+
+    future = _OLLAMA_EXECUTOR.submit(_job)
+    if not started.wait(timeout=QUEUE_TIMEOUT):
+        # Still queued behind other work after QUEUE_TIMEOUT; it has not begun.
         future.cancel()
         raise httpx.HTTPError(
-            "Ollama busy: timed out after 300 s waiting in queue. "
-            "The GPU may be stalled."
+            f"Ollama busy: still queued after {QUEUE_TIMEOUT} s behind other "
+            "local-model calls. Try again shortly."
         )
+    # Started: wait for completion with no wall-clock cap. A genuinely stalled
+    # GPU is caught by the per-chunk streaming timeout in _call_ollama_impl.
+    return future.result()
 
 
 def _call_openrouter(
@@ -551,6 +568,7 @@ def _extract_file_changes(raw: str, fallback_files: list[str]) -> dict[str, str]
 def _call_with_parse_retry(
     first_msg: str,
     fallback_files: list[str],
+    num_predict: int | None = None,
 ) -> tuple[dict[str, str] | None, str]:
     """
     Call the model with first_msg. If the output cannot be parsed into any
@@ -565,7 +583,7 @@ def _call_with_parse_retry(
     try:
         raw = _call_model(
             MODEL, [{"role": "user", "content": first_msg}], system=EDIT_SYSTEM,
-            num_ctx=NUM_CTX, temperature=TEMPERATURE,
+            num_ctx=NUM_CTX, num_predict=num_predict, temperature=TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return None, f"Model call failed: {e}"
@@ -585,7 +603,7 @@ def _call_with_parse_retry(
     try:
         raw = _call_model(
             MODEL, [{"role": "user", "content": retry_msg}], system=EDIT_SYSTEM,
-            num_ctx=NUM_CTX, temperature=TEMPERATURE,
+            num_ctx=NUM_CTX, num_predict=num_predict, temperature=TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return None, f"Model call failed on retry: {e}"
@@ -619,8 +637,14 @@ def _read_file(path: Path) -> tuple[str, bytes, bytes]:
     """
     Returns (lf_text, original_eol, original_bytes).
     The text is normalized to LF for the model; eol is captured to re-apply on write.
+
+    Raises UnicodeDecodeError for binary content (NUL byte sniff) or non-UTF-8
+    encodings; callers turn that into a clean diagnostic instead of crashing the
+    whole tool call. (Task-003)
     """
     raw = path.read_bytes()
+    if b"\x00" in raw[:8192]:
+        raise UnicodeDecodeError("utf-8", raw[:1], 0, 1, "NUL byte: file looks binary")
     eol = b"\r\n" if raw.count(b"\r\n") > 0 else b"\n"
     text = raw.decode("utf-8")
     lf_text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -668,21 +692,33 @@ _CHARS_PER_TOKEN = 3
 _PROMPT_OVERHEAD_TOKENS = 512
 
 
-def _check_input_size(content: str, ctx_limit: int, label: str) -> str | None:
+def _check_input_size(
+    content: str, ctx_limit: int, label: str, reserve_output: bool = False
+) -> str | None:
     """
-    Estimate the token count of *content* and reject if it would exceed
-    ctx_limit minus the reserved overhead budget.
+    Estimate the token count of *content* and reject if it will not fit.
 
-    Returns None if the size is acceptable, or a human-readable error string
-    if the content is too large to send to the model safely.
+    In Ollama, num_ctx covers prompt PLUS completion. For paths that regenerate
+    a whole file (edit/write), pass reserve_output=True to also require room for
+    an output of roughly the same size, so a file that fits as input but cannot
+    be fully re-emitted is rejected up front instead of producing a truncated
+    output that later trips a guard. (Task-006)
+
+    Returns None if acceptable, or a human-readable error string.
     """
     available = ctx_limit - _PROMPT_OVERHEAD_TOKENS
     estimated_tokens = len(content) // _CHARS_PER_TOKEN
     if estimated_tokens > available:
         return (
-            f"Error: {label} is too large for the configured edit_ctx={ctx_limit} tokens "
-            f"(estimated ~{estimated_tokens} tokens; limit after overhead is {available}). "
-            "Use the built-in Read or Edit tool for this file."
+            f"Error: {label} is too large to send to the model "
+            f"(estimated ~{estimated_tokens} tokens; limit after overhead is "
+            f"{available} of num_ctx={ctx_limit}). Use the built-in tools for this file."
+        )
+    if reserve_output and estimated_tokens * 2 > available:
+        return (
+            f"Error: {label} is too large to regenerate in one pass "
+            f"(input ~{estimated_tokens} tokens needs equal room for the output "
+            f"within num_ctx={ctx_limit}). Use the built-in Edit tool for this file."
         )
     return None
 
@@ -819,6 +855,11 @@ def local_read(files: list[str], instruction: str) -> str:
             return f"Error: not a regular file: {raw_path}"
         try:
             lf, _eol, _raw = _read_file(p)
+        except UnicodeDecodeError:
+            return (
+                f"Error: {raw_path} is not UTF-8 text (binary or unknown "
+                "encoding); use the built-in Read tool for this file."
+            )
         except OSError as e:
             return f"Error reading {raw_path}: {e}"
         file_blocks.append(f'«file path="{raw_path}"»\n{lf}\n«/file»')
@@ -883,6 +924,11 @@ def local_edit(files: list[str], instruction: str) -> str:
             return f"Error: not a regular file: {raw_path}"
         try:
             lf, eol, raw = _read_file(p)
+        except UnicodeDecodeError:
+            return (
+                f"Error: {raw_path} is not UTF-8 text (binary or unknown "
+                "encoding); use the built-in Edit tool for this file."
+            )
         except OSError as e:
             return f"Error reading {raw_path}: {e}"
         originals[raw_path] = (lf, eol, raw)
@@ -898,12 +944,21 @@ def local_edit(files: list[str], instruction: str) -> str:
     user_msg = f"{files_block}\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
 
-    size_err = _check_input_size(user_msg, NUM_CTX, f"{len(files)} file(s)")
+    size_err = _check_input_size(
+        user_msg, NUM_CTX, f"{len(files)} file(s)", reserve_output=True
+    )
     if size_err:
         return size_err
 
+    # Give the model room to emit the full file(s) but not ramble unbounded:
+    # cap num_predict at the context left after the input. (Task-006)
+    estimated_input = len(user_msg) // _CHARS_PER_TOKEN
+    edit_num_predict = max(256, (NUM_CTX - _PROMPT_OVERHEAD_TOKENS) - estimated_input)
+
     # 3. Call model (with one automatic retry on parse failure)
-    file_changes_raw, err = _call_with_parse_retry(user_msg, files)
+    file_changes_raw, err = _call_with_parse_retry(
+        user_msg, files, num_predict=edit_num_predict
+    )
     if file_changes_raw is None:
         return f"[{chosen}] {err}"
 
