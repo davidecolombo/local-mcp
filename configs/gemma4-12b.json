@@ -1,0 +1,10 @@
+{
+  "model": "gemma4:12b",
+  "ollama_url": "http://localhost:11434/api/chat",
+  "edit_ctx": 65536,
+  "snippet_ctx": 8192,
+  "snippet_num_predict": 2048,
+  "translate_ctx": 4096,
+  "translate_num_predict": 1024,
+  "timeout": 180
+}
