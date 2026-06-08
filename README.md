@@ -10,13 +10,13 @@ MCP server that delegates file operations to a local Ollama model so Claude only
 
 - [Ollama](https://ollama.com) running on `http://localhost:11434`
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) in PATH
-- Default model pulled: `ollama pull gemma4:e4b`
+- Default model pulled: `ollama pull gemma4:12b`
 
 ## Quick start
 
 ```powershell
 # 1. Set the active model config
-cp configs\gemma4-e4b.json model-config.json
+cp configs\gemma4-12b.json model-config.json
 
 # 2. Register the server globally (once)
 claude mcp add --scope user local-mcp uv run "C:/Users/user/.claude/local-mcp/server.py"
@@ -48,7 +48,8 @@ The server reads `model-config.json` at startup. If missing, built-in defaults a
 
 | Template | Model | Provider | Notes |
 |----------|-------|----------|-------|
-| `configs/gemma4-e4b.json` | `gemma4:e4b` | ollama | **Default.** 11 GB, 100% GPU, 32k ctx, 90 s timeout. |
+| `configs/gemma4-12b.json` | `gemma4:12b` | ollama | **Default.** 7.6 GB, 256k ctx, 64k edit ctx, 180 s timeout. |
+| `configs/gemma4-e4b.json` | `gemma4:e4b` | ollama | Lightweight. 11 GB, 32k ctx, 90 s timeout. |
 | `configs/qwen3-coder-30b.json` | `qwen3-coder:30b` | ollama | MoE 30B (~3B active). 120 s timeout. |
 | `configs/devstral-small-2-24b.json` | `devstral-small-2:24b` | ollama | Mistral code-agent model. 120 s timeout. |
 | `configs/qwen3-coder-480b-free.json` | `qwen/qwen3-coder:free` | openrouter | Remote free tier; requires `OPENROUTER_API_KEY`. |
