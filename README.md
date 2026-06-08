@@ -4,7 +4,7 @@ MCP server that delegates file operations to a local Ollama model so Claude only
 
 ## How it works
 
-`local_edit`, `local_write`, `local_read`, and `local_snippet` call a single configured Ollama model. `local_delete` and `local_rename` are pure filesystem operations with no model call. Parallel calls from agents are queued FIFO through a single-worker executor; the GPU processes one request at a time with no contention errors.
+`local_edit`, `local_write`, `local_read`, and `local_snippet` call a single configured Ollama model. Parallel calls from agents are queued FIFO through a single-worker executor; the GPU processes one request at a time with no contention errors. Deletion and rename are deliberately not tools: they involve no file body, so they save no Claude tokens; use the built-in tools or Bash for those.
 
 ## Prerequisites
 
@@ -33,9 +33,7 @@ Restart Claude Code after step 2 or 3. After any change to `model-config.json`, 
 |------|-------------|
 | `local_edit(files, instruction)` | Edit existing files. Best when files are not yet in Claude's context or the change spans many lines/files. |
 | `local_write(path, instruction)` | Create a new file from scratch. Saves tokens only when the instruction is much shorter than the output (stubs, boilerplate, scaffolds). |
-| `local_read(files, instruction)` | Read-only analysis: summarize, review, find patterns. Output flows back to Claude's context. |
-| `local_delete(paths)` | Delete files. No model call. |
-| `local_rename(src, dst)` | Rename or move a file. No model call. |
+| `local_read(files, instruction)` | Read-only analysis: summarize, review, find patterns. Output flows back to Claude's context. Not for verbatim retrieval (use the built-in Read). |
 | `local_snippet(prompt)` | Generate a short snippet returned as text. Output costs Claude tokens; use sparingly. |
 
 All instruction strings are translated server-side when non-English, so you can write instructions in any language.

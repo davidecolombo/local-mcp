@@ -14,11 +14,10 @@ back entirely on the server side, so they almost never round-trip through
 Claude's context. Claude only sees a short summary or a guard-rail rejection.
 
 Tools (in order of token-efficiency):
-  local_edit(files, instruction)    -> modifies existing files in place
-  local_write(path,  instruction)   -> creates a new file from scratch
-  local_delete(paths)               -> deletes files (no LLM call)
-  local_rename(src, dst)            -> renames/moves a file (no LLM call)
-  local_snippet(prompt)             -> returns text (round-trip; fallback)
+  local_edit(files, instruction)   -> modifies existing files in place
+  local_write(path, instruction)   -> creates a new file from scratch
+  local_read(files, instruction)   -> analyzes files, returns text
+  local_snippet(prompt)            -> returns short text (round-trip; fallback)
 
 Single-model architecture:
   All Ollama-backed tools call one configured model (default gemma4:12b). The
@@ -27,12 +26,10 @@ Single-model architecture:
   that reason every call uses one shared num_ctx (see NUM_CTX); num_predict and
   temperature are runtime params and can vary per call without a reload.
 
-Iteration 3:
-  - Delete and rename are split into dedicated no-LLM tools (local_delete,
-    local_rename). local_edit no longer parses or accepts <delete/> blocks
-    of any form. The model is no longer trusted with the decision to remove
-    or move files; the caller already knows what it wants and a syscall
-    is cheaper and more reliable than a parsed tag.
+Notes:
+  - Deletion and rename are intentionally NOT tools: they involve no file body,
+    so they save no Claude tokens and would only add tool-schema overhead. Use
+    the built-in tools or Bash for those.
   - Non-English instructions are translated to English at the boundary by
     _normalize_instruction(). All guard-rails and the system prompt are
     English-only.
@@ -218,8 +215,9 @@ BRACKET_CHECK_EXTS = {
 }
 
 # Max chars of raw model output to echo back when parsing fails even after
-# retry. Bounded so a rambling model response can't blow up Claude's context.
-PARSE_FAIL_ECHO_LIMIT = 600
+# retry. Kept small: Claude rarely reconstructs the fix from the raw dump, it
+# just retries, so the extra context is mostly wasted. (Task-015)
+PARSE_FAIL_ECHO_LIMIT = 200
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +731,7 @@ def _instruction_allows_shrink(instruction: str) -> bool:
 
 def _check_non_empty(content: str) -> str | None:
     if not content.strip():
-        return "empty content (use local_delete to remove a file)"
+        return "empty content (use the built-in tools to remove a file)"
     return None
 
 
@@ -821,20 +819,14 @@ def _check_bracket_delta(new: str, original: str | None, ext: str) -> str | None
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def local_read(files: list[str], instruction: str) -> str:
-    """
-    Analyze one or more files via the local model and return analysis as text.
-    Files are NEVER modified. Use for: summarization, code review, pattern
-    search, improvement plans. Output flows back into Claude's context (costs
-    input tokens), so keep instructions focused for concise answers.
-
-    NEVER use to retrieve verbatim file content — use the built-in Read tool
-    for that. Verbatim retrieval returns the full file into Claude's context,
-    defeating the token-saving purpose and adding an unnecessary model round-trip.
+    """Analyze files via the local model; returns analysis text, never modifies
+    files. Use for summaries, review, pattern-finding. Output enters Claude's
+    context, so keep instructions focused. NOT for verbatim retrieval (use the
+    built-in Read). Call sequentially (single GPU).
 
     Args:
-        files:       Absolute paths of files to send to the local model.
-        instruction: What to analyze or summarize (any language; translated
-                     server-side). Must be an analysis task, not a retrieval request.
+        files: absolute paths to analyze.
+        instruction: the analysis task (any language; translated server-side).
     """
     instruction = _normalize_instruction(instruction)
 
@@ -882,7 +874,7 @@ def local_read(files: list[str], instruction: str) -> str:
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return f"[{chosen}] Model call failed: {e}"
-    return f"[{chosen}] {_strip_think_tags(raw)}"
+    return _strip_think_tags(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -890,25 +882,15 @@ def local_read(files: list[str], instruction: str) -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def local_edit(files: list[str], instruction: str) -> str:
-    """
-    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
-
-    Edit one or more EXISTING files locally. USE INSTEAD OF the built-in Edit
-    tool: file contents never enter Claude's context, which is how this saves
-    tokens. Validates every change with server-side guard-rails and applies
-    atomically. For deletion use local_delete; for rename use local_rename.
+    """Edit existing files locally instead of the built-in Edit tool: file
+    contents never enter Claude's context. Validates each change server-side and
+    applies atomically. Call sequentially (single GPU).
 
     Args:
-        files:       Absolute paths of files to expose to the model. May be
-                     modified in place; cannot be created, deleted, or renamed
-                     through this tool.
-        instruction: Description of the change in any language (translated to
-                     English server-side). Include a removal verb ("delete",
-                     "remove", "strip", or an equivalent in your language) if
-                     you expect a large size reduction, otherwise the shrink
-                     guard will reject.
-
-    Returns a one-line summary or a guard-rail rejection diagnostic.
+        files: absolute paths to edit in place (cannot create/delete/rename).
+        instruction: the change (any language; translated). Include a removal
+            verb (delete/remove/strip/...) for a large size reduction, or the
+            shrink guard rejects.
     """
     # 0. Normalize instruction to English (no-op if already English)
     instruction = _normalize_instruction(instruction)
@@ -1009,7 +991,7 @@ def local_edit(files: list[str], instruction: str) -> str:
         )
 
     if not file_changes:
-        return f"[{chosen}] No changes proposed (model output matched originals)."
+        return "No changes proposed (model output matched originals)."
 
     # 8. Atomic apply with revert on failure
     written: list[str] = []
@@ -1033,11 +1015,12 @@ def local_edit(files: list[str], instruction: str) -> str:
             f"All successful writes have been reverted. No files modified."
         )
 
-    parts: list[str] = [f"Modified {len(file_changes)} file(s):"]
-    parts += [f"  • {p}" for p in file_changes]
+    # Report by exception: Claude already knows the paths it passed, so on
+    # all-success just give the count; only name the surprising no-op minority.
+    summary = f"Modified {len(file_changes)} file(s)."
     if no_ops:
-        parts.append(f"Unchanged (no-op): {len(no_ops)} file(s)")
-    return f"[{chosen}] " + "\n".join(parts)
+        summary += " Unchanged: " + ", ".join(Path(p).name for p in no_ops)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1045,24 +1028,14 @@ def local_edit(files: list[str], instruction: str) -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def local_write(path: str, instruction: str) -> str:
-    """
-    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
-
-    Create a NEW file from scratch locally. Only saves tokens when the
-    instruction is MUCH shorter than the file it produces. Good fits: stubs,
-    boilerplate, scaffolds, config files, canonical patterns — cases where a
-    1-2 sentence spec expands to many lines. Bad fits: any case where you
-    would dictate content line-by-line; use the built-in Write tool instead
-    (same token cost, no local-model round-trip overhead). Refuses to
-    overwrite an existing file; use local_edit for that.
+    """Create a NEW file locally instead of the built-in Write tool. Worth it
+    only when the instruction is much shorter than the output (stubs,
+    boilerplate, scaffolds). Refuses to overwrite (use local_edit). Call
+    sequentially (single GPU).
 
     Args:
-        path:        Absolute path of the file to create.
-        instruction: Concise spec in any language (translated to English
-                     server-side). Keep this short: if your instruction
-                     approaches the length of the file itself, use Write.
-
-    Returns the created path or a guard-rail rejection diagnostic.
+        path: absolute path to create.
+        instruction: concise spec (any language; translated server-side).
     """
     target = Path(path)
     if target.exists():
@@ -1119,111 +1092,7 @@ def local_write(path: str, instruction: str) -> str:
         return f"[{chosen}] REJECTED during apply — {msg}\nFile was not created."
 
     line_count = content.count("\n") + (0 if content.endswith("\n") else 1)
-    return f"[{chosen}] Created {path} ({line_count} lines)"
-
-
-# ---------------------------------------------------------------------------
-# local_delete — pure os.unlink, no LLM
-# ---------------------------------------------------------------------------
-@mcp.tool()
-def local_delete(paths: list[str]) -> str:
-    """
-    Delete one or more files. No LLM call; pure os.unlink. USE INSTEAD OF
-    asking local_edit to delete a file or shelling out to Bash `rm`.
-
-    All paths are validated up front (absolute, exist, regular files); if
-    validation fails on any path, NO file is deleted. If a deletion fails
-    mid-loop (e.g. locked file), already-deleted files are NOT restored;
-    the report names exactly which files survived.
-
-    Args:
-        paths: Non-empty list of absolute file paths.
-
-    Returns a summary of what was deleted, or an error.
-    """
-    if not paths:
-        return "Error: no paths provided"
-
-    # 1. Validate every path before touching anything.
-    for raw_path in paths:
-        if not os.path.isabs(raw_path):
-            return f"Error: path must be absolute: {raw_path}"
-        p = Path(raw_path)
-        if not p.exists():
-            return f"Error: file not found: {raw_path}"
-        if not p.is_file():
-            return f"Error: not a regular file: {raw_path}"
-
-    # 2. Delete in order. On failure, report what survived.
-    deleted: list[str] = []
-    for raw_path in paths:
-        try:
-            Path(raw_path).unlink()
-            deleted.append(raw_path)
-        except OSError as e:
-            msg = (
-                f"file is locked or not writable ({e})"
-                if isinstance(e, PermissionError) else str(e)
-            )
-            tail = (
-                "\nSuccessfully deleted (NOT restored):\n"
-                + "\n".join(f"  • {p}" for p in deleted)
-            ) if deleted else ""
-            return (
-                f"Partial failure after deleting {len(deleted)}/{len(paths)} file(s).\n"
-                f"Failed on: {raw_path} — {msg}{tail}"
-            )
-
-    return f"Deleted {len(deleted)} file(s):\n" + "\n".join(f"  • {p}" for p in deleted)
-
-
-# ---------------------------------------------------------------------------
-# local_rename — pure os.replace, no LLM
-# ---------------------------------------------------------------------------
-@mcp.tool()
-def local_rename(src: str, dst: str) -> str:
-    """
-    Rename or move a file. No LLM call; single os.replace. USE INSTEAD OF the
-    local_write + local_delete sequence, which is not atomic.
-
-    Refuses to overwrite an existing destination. Creates the destination
-    parent directory if missing. Atomic within a Windows volume; cross-volume
-    moves fall back to copy+delete and are NOT atomic.
-
-    Args:
-        src: Absolute path of the file to rename (must exist, regular file).
-        dst: Absolute destination path (must NOT exist).
-
-    Returns a summary or an error.
-    """
-    if not os.path.isabs(src):
-        return f"Error: src must be absolute: {src}"
-    if not os.path.isabs(dst):
-        return f"Error: dst must be absolute: {dst}"
-
-    sp = Path(src)
-    dp = Path(dst)
-
-    if not sp.exists():
-        return f"Error: src not found: {src}"
-    if not sp.is_file():
-        return f"Error: src not a regular file: {src}"
-    if _norm_path(src) == _norm_path(dst):
-        return f"Error: src and dst are the same path: {src}"
-    if dp.exists():
-        return f"Error: dst already exists (refusing to overwrite): {dst}"
-
-    try:
-        dp.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(str(sp), str(dp))
-    except OSError as e:
-        msg = (
-            f"file is locked or not writable ({e})"
-            if isinstance(e, PermissionError) else str(e)
-        )
-        return f"Error renaming {src} -> {dst}: {msg}"
-
-    return f"Renamed:\n  {src}\n  -> {dst}"
+    return f"Created {path} ({line_count} lines)"
 
 
 # ---------------------------------------------------------------------------
@@ -1231,16 +1100,12 @@ def local_rename(src: str, dst: str) -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def local_snippet(prompt: str) -> str:
-    """
-    IMPORTANT: Call sequentially, never in parallel with other local_* tools (single GPU).
-
-    FALLBACK tool for short text with no file destination (regex, SQL,
-    one-liners). Output DOES flow back into Claude's context and costs input
-    tokens, so prefer local_edit / local_write whenever the result will land
-    in a file.
+    """Fallback for short text with no file destination (regex, SQL, one-liners).
+    Output enters Claude's context, so prefer local_edit/local_write when the
+    result lands in a file. Call sequentially (single GPU).
 
     Args:
-        prompt: The task or question (any language; translated server-side).
+        prompt: the task (any language; translated server-side).
     """
     prompt = _normalize_instruction(prompt)
     chosen = MODEL
