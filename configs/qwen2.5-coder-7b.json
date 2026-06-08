@@ -1,10 +1,11 @@
 {
   "model": "qwen2.5-coder:7b",
   "ollama_url": "http://localhost:11434/api/chat",
-  "edit_ctx": 32768,
-  "snippet_ctx": 4096,
+  "num_ctx": 32768,
   "snippet_num_predict": 1024,
-  "translate_ctx": 2048,
   "translate_num_predict": 512,
+  "temperature": 0,
+  "read_temperature": 0.2,
+  "repeat_penalty": 1.0,
   "timeout": 90
 }

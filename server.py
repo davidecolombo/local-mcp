@@ -20,14 +20,12 @@ Tools (in order of token-efficiency):
   local_rename(src, dst)            -> renames/moves a file (no LLM call)
   local_snippet(prompt)             -> returns text (round-trip; fallback)
 
-Single-model architecture (iteration 2):
-  All Ollama-backed tools call qwen3-coder:30b (MoE, 3B active params per
-  token). 16 GB VRAM cannot host two models simultaneously, so trying to
-  alternate between a small and large tier just thrashes. The coder model is
-  pinned in VRAM with keep_alive=-1 so it never gets evicted between calls.
-  Some expert layers spill to CPU (~27%) — acceptable because MoE only
-  activates ~3B of the 30B total params per token. Measured ~48 tok/s on
-  RTX 5070 Ti.
+Single-model architecture:
+  All Ollama-backed tools call one configured model (default gemma4:12b). The
+  model is kept resident with keep_alive=-1, but that only holds while num_ctx
+  stays constant: a different num_ctx makes Ollama reload the model (~5 s). For
+  that reason every call uses one shared num_ctx (see NUM_CTX); num_predict and
+  temperature are runtime params and can vary per call without a reload.
 
 Iteration 3:
   - Delete and rename are split into dedicated no-LLM tools (local_delete,
@@ -73,12 +71,26 @@ _CONFIG_DEFAULTS: dict = {
     "openrouter_referer": "https://claude.ai/code",
     "openrouter_title": "local-mcp",
     "openrouter_extra_body": {},
-    # Shared
-    "edit_ctx": 32768,
-    "snippet_ctx": 4096,
+    # Context window. ONE value for every Ollama call on purpose: changing
+    # num_ctx between calls forces Ollama to reload the model (~5 s) and defeats
+    # keep_alive, so snippet/translate no longer use smaller contexts. (Task-022)
+    "num_ctx": 32768,
+    # Max output tokens per call type. num_predict is a runtime parameter; it
+    # does NOT trigger a reload, so it can vary freely.
     "snippet_num_predict": 1024,
-    "translate_ctx": 2048,
     "translate_num_predict": 512,
+    # Sampling. temperature 0 keeps full-file regeneration deterministic and
+    # format-clean; read_temperature adds a little fluency for analysis output.
+    # repeat_penalty 1.0 disables the penalty (code legitimately repeats tokens,
+    # which matters for verbose languages like Java). top_p/top_k/seed/num_gpu
+    # are optional: when null the model's own default applies. (Task-018)
+    "temperature": 0,
+    "read_temperature": 0.2,
+    "repeat_penalty": 1.0,
+    "top_p": None,
+    "top_k": None,
+    "seed": None,
+    "num_gpu": None,
     "timeout": 1200,
 }
 
@@ -98,6 +110,12 @@ def _load_model_config() -> dict:
                 for key in _CONFIG_DEFAULTS:
                     if key in user_cfg:
                         cfg[key] = user_cfg[key]
+                # Backward compat: older configs used edit_ctx (plus
+                # snippet_ctx/translate_ctx). Map edit_ctx onto the unified
+                # num_ctx; the smaller per-task contexts are intentionally
+                # dropped because varying num_ctx reloads the model (Task-022).
+                if "num_ctx" not in user_cfg and "edit_ctx" in user_cfg:
+                    cfg["num_ctx"] = user_cfg["edit_ctx"]
         except (json.JSONDecodeError, OSError):
             pass  # Malformed or unreadable — use defaults silently
     return cfg
@@ -112,11 +130,16 @@ OPENROUTER_URL: str        = _cfg["openrouter_url"]
 OPENROUTER_REFERER: str    = _cfg["openrouter_referer"]
 OPENROUTER_TITLE: str      = _cfg["openrouter_title"]
 OPENROUTER_EXTRA_BODY: dict = _cfg["openrouter_extra_body"]
-EDIT_CTX: int              = _cfg["edit_ctx"]
-SNIPPET_CTX: int           = _cfg["snippet_ctx"]
+NUM_CTX: int               = _cfg["num_ctx"]
 SNIPPET_NUM_PREDICT: int   = _cfg["snippet_num_predict"]
-TRANSLATE_CTX: int         = _cfg["translate_ctx"]
 TRANSLATE_NUM_PREDICT: int = _cfg["translate_num_predict"]
+TEMPERATURE                = _cfg["temperature"]
+READ_TEMPERATURE           = _cfg["read_temperature"]
+REPEAT_PENALTY             = _cfg["repeat_penalty"]
+TOP_P                      = _cfg["top_p"]
+TOP_K                      = _cfg["top_k"]
+SEED                       = _cfg["seed"]
+NUM_GPU                    = _cfg["num_gpu"]
 TIMEOUT: int               = _cfg["timeout"]
 
 if PROVIDER == "openrouter":
@@ -202,21 +225,41 @@ def _call_ollama_impl(
     system: str | None,
     num_ctx: int | None,
     num_predict: int | None,
+    temperature: float | None,
 ) -> str:
     """HTTP call to Ollama. Runs inside the single-worker executor."""
-    options: dict = {"num_ctx": num_ctx if num_ctx is not None else EDIT_CTX}
+    options: dict = {"num_ctx": num_ctx if num_ctx is not None else NUM_CTX}
     if num_predict is not None:
         options["num_predict"] = num_predict
+    # Sampling knobs (Task-018). temperature is per-call; the rest are global.
+    # Only emit a key when it is set so the model's own default applies when null.
+    if temperature is not None:
+        options["temperature"] = temperature
+    if REPEAT_PENALTY is not None:
+        options["repeat_penalty"] = REPEAT_PENALTY
+    if TOP_P is not None:
+        options["top_p"] = TOP_P
+    if TOP_K is not None:
+        options["top_k"] = TOP_K
+    if SEED is not None:
+        options["seed"] = SEED
+    if NUM_GPU is not None:
+        options["num_gpu"] = NUM_GPU
+    # Ollama's /api/chat IGNORES a top-level "system" field; the system prompt
+    # must be a role:"system" message. Prepend it here. (Task-001)
+    chat_messages = messages
+    if system:
+        chat_messages = [{"role": "system", "content": system}] + list(messages)
     payload: dict = {
         "model": model,
-        "messages": messages,
+        "messages": chat_messages,
         "stream": True,
-        # Pin the model in VRAM forever — single-model architecture, no eviction.
+        # Keep the model resident. This only holds while num_ctx is constant
+        # across calls; a different num_ctx forces a reload (~5 s), so every
+        # call uses one shared NUM_CTX. (Task-022)
         "keep_alive": -1,
         "options": options,
     }
-    if system:
-        payload["system"] = system
     # Streaming: timeout applies per-chunk, not to the whole response.
     # This avoids false timeouts when the model outputs a large file; as long
     # as the model keeps producing tokens the connection stays alive.
@@ -244,6 +287,7 @@ def _call_ollama(
     system: str | None = None,
     num_ctx: int | None = None,
     num_predict: int | None = None,
+    temperature: float | None = None,
 ) -> str:
     """Submit an Ollama call to the single-worker queue and wait for the result.
 
@@ -251,7 +295,7 @@ def _call_ollama(
     A 300 s wait-timeout guards against a stalled GPU.
     """
     future = _OLLAMA_EXECUTOR.submit(
-        _call_ollama_impl, model, messages, system, num_ctx, num_predict
+        _call_ollama_impl, model, messages, system, num_ctx, num_predict, temperature
     )
     try:
         return future.result(timeout=300)
@@ -269,6 +313,7 @@ def _call_openrouter(
     system: str | None = None,
     num_ctx: int | None = None,       # accepted but ignored; OpenRouter decides context
     num_predict: int | None = None,   # -> max_tokens
+    temperature: float | None = None,
 ) -> str:
     """Call an OpenAI-compatible remote endpoint (OpenRouter), non-streaming."""
     full_messages: list[dict] = []
@@ -283,6 +328,8 @@ def _call_openrouter(
     }
     if num_predict is not None:
         payload["max_tokens"] = num_predict
+    if temperature is not None:
+        payload["temperature"] = temperature
     if OPENROUTER_EXTRA_BODY:
         payload.update(OPENROUTER_EXTRA_BODY)
 
@@ -323,11 +370,12 @@ def _call_model(
     system: str | None = None,
     num_ctx: int | None = None,
     num_predict: int | None = None,
+    temperature: float | None = None,
 ) -> str:
     """Dispatch to the configured provider (Ollama or OpenRouter)."""
     if PROVIDER == "openrouter":
-        return _call_openrouter(model, messages, system, num_ctx, num_predict)
-    return _call_ollama(model, messages, system, num_ctx, num_predict)
+        return _call_openrouter(model, messages, system, num_ctx, num_predict, temperature)
+    return _call_ollama(model, messages, system, num_ctx, num_predict, temperature)
 
 
 def _strip_think_tags(text: str) -> str:
@@ -413,8 +461,9 @@ def _normalize_instruction(instruction: str) -> str:
                 "explanation, no markdown.\n\n"
                 f"{_maybe_no_think(instruction)}"
             )}],
-            num_ctx=TRANSLATE_CTX,
+            num_ctx=NUM_CTX,
             num_predict=TRANSLATE_NUM_PREDICT,
+            temperature=TEMPERATURE,
         )
     except httpx.HTTPError:
         return instruction
@@ -515,7 +564,8 @@ def _call_with_parse_retry(
     """
     try:
         raw = _call_model(
-            MODEL, [{"role": "user", "content": first_msg}], system=EDIT_SYSTEM
+            MODEL, [{"role": "user", "content": first_msg}], system=EDIT_SYSTEM,
+            num_ctx=NUM_CTX, temperature=TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return None, f"Model call failed: {e}"
@@ -534,7 +584,8 @@ def _call_with_parse_retry(
     )
     try:
         raw = _call_model(
-            MODEL, [{"role": "user", "content": retry_msg}], system=EDIT_SYSTEM
+            MODEL, [{"role": "user", "content": retry_msg}], system=EDIT_SYSTEM,
+            num_ctx=NUM_CTX, temperature=TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return None, f"Model call failed on retry: {e}"
@@ -775,7 +826,7 @@ def local_read(files: list[str], instruction: str) -> str:
     user_msg = "\n\n".join(file_blocks) + f"\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
 
-    size_err = _check_input_size(user_msg, EDIT_CTX, f"{len(files)} file(s)")
+    size_err = _check_input_size(user_msg, NUM_CTX, f"{len(files)} file(s)")
     if size_err:
         return size_err
 
@@ -785,7 +836,8 @@ def local_read(files: list[str], instruction: str) -> str:
             chosen,
             [{"role": "user", "content": user_msg}],
             system=READ_SYSTEM,
-            num_ctx=EDIT_CTX,
+            num_ctx=NUM_CTX,
+            temperature=READ_TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return f"[{chosen}] Model call failed: {e}"
@@ -846,7 +898,7 @@ def local_edit(files: list[str], instruction: str) -> str:
     user_msg = f"{files_block}\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
 
-    size_err = _check_input_size(user_msg, EDIT_CTX, f"{len(files)} file(s)")
+    size_err = _check_input_size(user_msg, NUM_CTX, f"{len(files)} file(s)")
     if size_err:
         return size_err
 
@@ -1147,8 +1199,9 @@ def local_snippet(prompt: str) -> str:
             chosen,
             [{"role": "user", "content": full_prompt}],
             system=snippet_system,
-            num_ctx=SNIPPET_CTX,
+            num_ctx=NUM_CTX,
             num_predict=SNIPPET_NUM_PREDICT,
+            temperature=READ_TEMPERATURE,
         )
     except httpx.HTTPError as e:
         return f"[{chosen}] Model call failed: {e}"
