@@ -183,6 +183,16 @@ The server is silent by default (no log file, nothing on stdout/stderr, so the M
 $env:LOCAL_MCP_DEBUG = "1"   # then restart the MCP server
 ```
 
+## Tests
+
+A single model-free smoke test covers the corruption-risk path (the `«file»` parser, the guard-rails, the size budget, CRLF/binary handling, and language detection). No Ollama or network is needed:
+
+```powershell
+uv run tests/test_guards.py
+```
+
+It is deliberately minimal: there is no coverage goal and no CI. It exists only because a silent regression in the guards is the one failure that could corrupt a file.
+
 ## License
 
 GNU Affero GPL v3. See [LICENSE](LICENSE).
