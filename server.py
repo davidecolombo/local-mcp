@@ -152,16 +152,39 @@ _CONFIG_DEFAULTS: dict = {
     "top_k": None,
     "seed": None,
     "num_gpu": None,
+    # Reasoning ("thinking") toggle for thinking-capable models (e.g. gemma4,
+    # qwen3). These tools want the answer, not the chain-of-thought: when thinking
+    # is on, the model spends its num_predict budget emitting a `thinking` stream
+    # and can hit the token cap (done_reason="length") before producing ANY
+    # `message.content`, which _stream_ollama then returns as "". Forcing it off
+    # keeps the whole budget for the answer. Ollama ignores this key for models
+    # that do not support thinking, so it is safe to always send. (Task-025)
+    "think": False,
     "timeout": 1200,
     # Seconds to wait in the single-worker FIFO queue before giving up. Bounds
     # ONLY the wait to start, not generation; once a call begins streaming,
     # the per-chunk `timeout` above governs it. (Task-004)
-    "queue_timeout": 300,
+    #
+    # null (default) => derive it from `timeout`: a queued call must outwait the
+    # calls ahead of it, so the queue wait is QUEUE_TIMEOUT_FACTOR x `timeout`
+    # (room for several parallel calls to drain one-by-one). A standalone number
+    # could sit BELOW `timeout`, letting a queued call give up before a single
+    # call ahead can even finish; an explicit value below `timeout` is raised to
+    # `timeout` for the same reason. The per-chunk `timeout` is the real stall
+    # guard, so a generous queue wait is safe. (Task-026)
+    "queue_timeout": None,
     # "WARNING" (default, silent) or "DEBUG" to trace to local-mcp.log. The
     # LOCAL_MCP_DEBUG=1 env var does the same and applies even before this file
     # is read. (Task-008)
     "log_level": "WARNING",
 }
+
+# A queued call must be willing to wait for the calls ahead of it to drain on the
+# single GPU worker; one call is bounded by `timeout`, so the queue wait is a
+# multiple of it. 4x leaves room for a handful of parallel calls (Claude Code
+# fires tool calls in parallel) without rejecting work that would still be served
+# shortly. (Task-026)
+_QUEUE_TIMEOUT_FACTOR = 4
 
 
 def _load_model_config() -> dict:
@@ -171,11 +194,13 @@ def _load_model_config() -> dict:
     """
     config_path = Path(__file__).resolve().parent / "model-config.json"
     cfg = dict(_CONFIG_DEFAULTS)
+    user_cfg: dict = {}
     if config_path.is_file():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
-                user_cfg = json.load(f)
-            if isinstance(user_cfg, dict):
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                user_cfg = loaded
                 for key in _CONFIG_DEFAULTS:
                     if key in user_cfg:
                         cfg[key] = user_cfg[key]
@@ -188,6 +213,18 @@ def _load_model_config() -> dict:
         except (json.JSONDecodeError, OSError) as e:
             # Use defaults, but leave a trace (visible only when debug is on).
             _log.warning("malformed model-config.json (%s); using defaults", e)
+    # Keep the queue wait aligned with the per-call timeout (Task-026). Derive it
+    # when unset; if set explicitly but below one full call, raise it so a queued
+    # call never gives up before a single call ahead of it can finish.
+    if user_cfg.get("queue_timeout") is None:
+        cfg["queue_timeout"] = cfg["timeout"] * _QUEUE_TIMEOUT_FACTOR
+    elif cfg["queue_timeout"] < cfg["timeout"]:
+        _log.warning(
+            "queue_timeout (%s) is below timeout (%s); raising it to timeout so a "
+            "queued call is not rejected before a single call ahead can finish.",
+            cfg["queue_timeout"], cfg["timeout"],
+        )
+        cfg["queue_timeout"] = cfg["timeout"]
     return cfg
 
 
@@ -215,6 +252,7 @@ TOP_P                      = _cfg["top_p"]
 TOP_K                      = _cfg["top_k"]
 SEED                       = _cfg["seed"]
 NUM_GPU                    = _cfg["num_gpu"]
+THINK                      = _cfg["think"]
 TIMEOUT: int               = _cfg["timeout"]
 QUEUE_TIMEOUT: int         = _cfg["queue_timeout"]
 
@@ -374,6 +412,8 @@ def _map_ollama_error(model: str, exc: Exception) -> str:
 def _stream_ollama(payload: dict) -> str:
     """One streaming request to Ollama. Raises httpx errors; caller maps them."""
     chunks: list[str] = []
+    saw_thinking = False
+    done_reason: str | None = None
     with httpx.stream("POST", OLLAMA_URL, json=payload, timeout=TIMEOUT) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
@@ -383,12 +423,27 @@ def _stream_ollama(payload: dict) -> str:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            content = data.get("message", {}).get("content", "")
+            message = data.get("message", {})
+            content = message.get("content", "")
             if content:
                 chunks.append(content)
+            if message.get("thinking"):
+                saw_thinking = True
             if data.get("done", False):
+                done_reason = data.get("done_reason")
                 break
-    return "".join(chunks)
+    out = "".join(chunks)
+    # A thinking-capable model can burn the whole num_predict budget on its
+    # `thinking` stream and stop (done_reason="length") before emitting any
+    # answer, leaving content empty. Surface that instead of returning "".
+    # The fix is to keep thinking off (THINK=False) or raise num_predict. (Task-025)
+    if not out and saw_thinking:
+        raise httpx.HTTPError(
+            "Model produced only reasoning ('thinking') and no answer before the "
+            f"output budget ran out (done_reason={done_reason!r}). Set \"think\": "
+            "false in model-config.json (or raise *_num_predict)."
+        )
+    return out
 
 
 def _call_ollama_impl(
@@ -430,6 +485,9 @@ def _call_ollama_impl(
         # across calls; a different num_ctx forces a reload (~5 s), so every
         # call uses one shared NUM_CTX. (Task-022)
         "keep_alive": -1,
+        # Disable the model's reasoning phase so num_predict is spent on the
+        # answer, not a `thinking` stream (see THINK config). (Task-025)
+        "think": THINK,
         "options": options,
     }
     # Streaming: timeout applies per-chunk, not to the whole response (avoids
