@@ -4,13 +4,15 @@ MCP server that delegates file operations to a local Ollama model so Claude only
 
 ## How it works
 
-`local_edit`, `local_write`, `local_read`, and `local_snippet` call a single configured Ollama model. Parallel calls from agents are queued FIFO through a single-worker executor; the GPU processes one request at a time with no contention errors. Deletion and rename are deliberately not tools: they involve no file body, so they save no Claude tokens; use the built-in tools or Bash for those.
+`local_edit`, `local_write`, `local_read`, and `local_snippet` call a single configured Ollama model. `local_outline` answers structural questions with no model call at all (deterministic parsing). Parallel calls from agents are queued FIFO through a single-worker executor; the GPU processes one request at a time with no contention errors. Deletion and rename are deliberately not tools: they involve no file body, so they save no Claude tokens; use the built-in tools or Bash for those.
 
 ## Prerequisites
 
 - [Ollama](https://ollama.com) running on `http://localhost:11434`
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) in PATH
 - Default model pulled: `ollama pull gemma4:12b`
+
+Python dependencies (including `tree-sitter` and `tree-sitter-java`, used by `local_outline`) are declared inline in `server.py` and installed automatically by `uv run`. If tree-sitter is unavailable for some reason the server still runs; only the Java outline path degrades (it returns a clear error or falls back to chunking).
 
 ## Quick start
 
@@ -31,12 +33,40 @@ Restart Claude Code after step 2 or 3. After any change to `model-config.json`, 
 
 | Tool | When to use |
 |------|-------------|
-| `local_edit(files, instruction)` | Edit existing files. Best when files are not yet in Claude's context or the change spans many lines/files. |
-| `local_write(path, instruction)` | Create a new file from scratch. Saves tokens only when the instruction is much shorter than the output (stubs, boilerplate, scaffolds). |
-| `local_read(files, instruction)` | Read-only analysis: summarize, review, find patterns. Output flows back to Claude's context. Not for verbatim retrieval (use the built-in Read). |
+| `local_outline(files)` | Get an API skeleton (package, types, annotations, fields, method signatures; no bodies) for `.java`/`.py`. Deterministic, no model call. Use instead of Read/local_read when you need an interface or shape, not implementations. |
+| `local_edit(files, instruction, context_files=None)` | Edit existing files. Best when files are not yet in Claude's context or the change spans many lines/files. |
+| `local_write(path, instruction, context_files=None)` | Create a new file from scratch. Saves tokens only when the instruction is much shorter than the output (stubs, boilerplate, scaffolds). |
+| `local_read(files, instruction)` | Read-only analysis: summarize, review, find patterns. Output flows back to Claude's context. Not for verbatim retrieval (use the built-in Read). Inputs larger than one context window are handled by map-reduce over the free local model instead of being refused. |
 | `local_snippet(prompt)` | Generate a short snippet returned as text. Output costs Claude tokens; use sparingly. |
 
 All instruction strings are translated server-side when non-English, so you can write instructions in any language.
+
+`local_edit` and `local_write` accept an optional `context_files`: absolute paths the local model may **read** for reference (an interface being implemented, a caller's signature, a constants module) but may **not** modify. They are embedded in the prompt as read-only `«context»` blocks and are never added to the editable allowlist, so a cross-file edit can get the details right (exact method names, signatures) without those files entering Claude's context. If the model emits a change for a context file it is rejected like any other out-of-allowlist path. Context files count toward the input-size budget.
+
+### Structural reads (deterministic + map-reduce)
+
+The local model and deterministic parsing are both free, so reads do not have to be one model pass over raw bytes:
+
+- **`local_outline`** parses `.java` (via `tree-sitter`) and `.py` (via the stdlib `ast`) into a compact API skeleton with no model call at all. When Claude needs an interface, a method signature, or "what does this class expose", this returns a few hundred tokens of exact structure instead of the whole file. It is also the right first step before a cross-file edit: outline a collaborator, then pass it as a `context_file`.
+- **`local_read` map-reduce**: when the combined input exceeds one context window, each file is summarized in its own free local call and the partials are synthesized into one answer, instead of refusing with "input too large". Oversized code files are first reduced to their skeleton (no extra model cost); only a file with no usable skeleton is chunked by lines. None of the raw bytes enter Claude's context.
+
+When a `.java` or `.kt` file is the target, a short Java/Spring rules block is appended to the system prompt (emit the package for the file's location, preserve every import and annotation, never omit boilerplate behind a comment, follow idiomatic Spring). It loads only for Java/Kotlin targets, so non-Java calls pay nothing for it.
+
+### Spring scaffolding recipes
+
+Spring is the textbook case for this server: a one-line spec expands into a large, heavily annotated class whose bytes never need to touch Claude's context. Route these to `local_write` (or `local_edit` when the file exists) instead of dictating them:
+
+| One-line spec to `local_write` | Expands to |
+|--------------------------------|-----------|
+| "a JPA entity `User` with id, email, createdAt" | `@Entity` class with `@Id`/`@GeneratedValue`, `@Column` fields, getters/setters |
+| "a Spring Data repository for `User`" | `interface UserRepository extends JpaRepository<User, Long>` |
+| "a `@RestController` for `User` with CRUD endpoints and a `UserDto`" | controller plus DTO record |
+| "a `@Service` `UserService` skeleton using `UserRepository`" | service with constructor injection |
+| "a `@Configuration` exposing a `RestTemplate` bean" | config class with `@Bean` method |
+| "a MapStruct mapper between `User` and `UserDto`" | `@Mapper` interface |
+| "a JUnit 5 test stub for `UserService`" | test class with mocked repository |
+
+For a multi-class change (e.g. editing a `@Service` that depends on an entity and repository), pass the collaborators as `context_files` so the model sees the types it depends on (exact method names, signatures) without Claude reading them into context and without making them editable.
 
 ## Model configuration
 
@@ -75,13 +105,22 @@ For OpenRouter, also set `openrouter_url`, `openrouter_referer`, `openrouter_tit
 
 Applied per `«file»` block before any write. All checks run server-side; Claude only sees accept/reject.
 
-1. **Non-empty**: empty content rejected (use `local_delete` to remove a file).
+1. **Non-empty**: empty content rejected (use the built-in tools to remove a file).
 2. **No truncation markers**: lines matching lazy-output patterns (`... rest unchanged`, `// existing code`, `<TRUNCATED>`, etc.) rejected unless already in the original.
 3. **No suspicious shrink**: new size < 50% of original without a removal keyword in the instruction is rejected.
 4. **Bracket delta**: unmatched `{}`, `()`, `[]` count must match the original's delta (code files only).
 5. **Semantic parse**: `.py` files checked with `ast.parse`; `.json` with `json.loads`. Syntax errors include the line number.
 6. **Identity no-op**: files unchanged by the model are silently skipped.
 7. **Path allowlist**: model can only emit blocks for paths passed in `files`.
+
+### Java/Kotlin guards
+
+Java and Spring are verbose and boilerplate-heavy, so they are where the server saves the most tokens and where a small model is most likely to slip. For `.java`/`.kt` targets four extra deterministic checks run (no model call):
+
+1. **Omission placeholders**: a comment-only line that reduces to a known placeholder phrase (`// getters and setters`, `// ... rest of the class ...`, `// other methods unchanged`, `// constructors omitted`, `// (unchanged)`, etc.) is rejected unless it was already in the original. Normalization strips comment delimiters, dots, and parentheses, so only pure placeholder comments match.
+2. **Package matches path**: under a `src/{main,test}/{java,kotlin}` root, the emitted `package` must mirror the directory. A wrong or missing package is a guaranteed compile break.
+3. **Public type matches filename**: `Foo.java` must declare `public class|interface|record|enum Foo` (skipped for `package-info`/`module-info`, and for Kotlin, which does not tie types to filenames).
+4. **Import-loss heuristic** (edit only): a material drop in `import` lines with no removal keyword in the instruction is flagged, catching imports the model silently dropped.
 
 If any check fails, the entire batch is rejected and no file is touched. On parse failure (no `«file»` blocks), the server retries once with a stricter prompt before surfacing an error.
 

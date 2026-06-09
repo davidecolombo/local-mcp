@@ -4,6 +4,8 @@
 # dependencies = [
 #   "mcp[cli]>=1.0.0",
 #   "httpx>=0.27.0",
+#   "tree-sitter>=0.21",
+#   "tree-sitter-java>=0.21",
 # ]
 # ///
 """
@@ -14,9 +16,10 @@ back entirely on the server side, so they almost never round-trip through
 Claude's context. Claude only sees a short summary or a guard-rail rejection.
 
 Tools (in order of token-efficiency):
+  local_outline(files)             -> deterministic API skeleton, NO model call
   local_edit(files, instruction)   -> modifies existing files in place
   local_write(path, instruction)   -> creates a new file from scratch
-  local_read(files, instruction)   -> analyzes files, returns text
+  local_read(files, instruction)   -> analyzes files, returns text (map-reduce if large)
   local_snippet(prompt)            -> returns short text (round-trip; fallback)
 
 Single-model architecture:
@@ -51,6 +54,22 @@ from pathlib import Path
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+
+# tree-sitter is optional: when present it lets local_read / local_outline
+# extract Java structure deterministically with no model call (Task-023). If it
+# is missing the server still runs; the structural paths fall back gracefully.
+try:
+    import tree_sitter_java as _tsjava
+    from tree_sitter import Language as _TSLanguage, Parser as _TSParser
+
+    _JAVA_LANGUAGE = _TSLanguage(_tsjava.language())
+    try:
+        _JAVA_PARSER = _TSParser(_JAVA_LANGUAGE)   # tree-sitter >= 0.22
+    except TypeError:                              # older API
+        _JAVA_PARSER = _TSParser()
+        _JAVA_PARSER.set_language(_JAVA_LANGUAGE)
+except Exception:
+    _JAVA_PARSER = None
 
 mcp = FastMCP("local-mcp")
 
@@ -218,6 +237,48 @@ BRACKET_CHECK_EXTS = {
 # retry. Kept small: Claude rarely reconstructs the fix from the raw dump, it
 # just retries, so the extra context is mostly wasted. (Task-015)
 PARSE_FAIL_ECHO_LIMIT = 200
+
+# ---------------------------------------------------------------------------
+# Java/Kotlin guard data (Task-020). Java and Spring are a top use-case and are
+# exactly where a 12B model omits boilerplate or breaks the package/filename
+# contract; these are catchable deterministically with no model call.
+# ---------------------------------------------------------------------------
+_JAVA_EXTS = {".java", ".kt"}
+
+# Canonical "I omitted real code here" comment phrases. A new line is flagged
+# only when, after stripping comment delimiters and filler (dots, parens, the
+# article "the"), it reduces to one of these AND it was not already present in
+# the original. The normalization keeps this conservative: only pure placeholder
+# comments match, not comments that merely contain one of these words.
+_JAVA_PLACEHOLDER_PHRASES = frozenset({
+    "getters and setters", "getter and setter", "getters setters",
+    "rest of class", "rest of file", "rest of code", "rest of method",
+    "other methods", "other methods unchanged", "other fields",
+    "other members", "other code",
+    "existing methods", "existing code", "existing fields", "existing members",
+    "remaining methods", "remaining fields", "remaining code",
+    "constructors omitted", "constructor omitted", "methods omitted",
+    "fields omitted", "imports omitted", "body omitted",
+    "unchanged", "no change", "no changes",
+})
+
+_JAVA_COMMENT_PREFIX_RE = re.compile(r"^\s*(?://+|/\*+|\*+|#)")
+_JAVA_COMMENT_OPEN_RE = re.compile(r"^\s*(?://+|/\*+|\*+|#)\s*")
+_JAVA_COMMENT_CLOSE_RE = re.compile(r"\s*\*/\s*$")
+
+# Source roots under which a file's package must mirror its directory layout.
+_JAVA_SOURCE_ROOTS = (
+    ("src", "main", "java"), ("src", "test", "java"),
+    ("src", "main", "kotlin"), ("src", "test", "kotlin"),
+)
+
+# Kotlin omits the trailing semicolon, so it is optional here.
+_PACKAGE_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;?", re.MULTILINE)
+_PUBLIC_TYPE_RE = re.compile(
+    r"\bpublic\s+(?:final\s+|abstract\s+|sealed\s+|non-sealed\s+|strictfp\s+)*"
+    r"(?:class|interface|enum|record|@interface)\s+(\w+)"
+)
+_IMPORT_LINE_RE = re.compile(r"^\s*import\s+", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -493,8 +554,8 @@ EDIT_SYSTEM = """\
 Code editing assistant. Output ONLY «file» blocks with the COMPLETE new content
 of each modified file. No prose, no markdown fences, no other tags. Use the
 exact absolute path from the input. Omit unchanged files. Never truncate,
-never use "... rest unchanged" placeholders. Never emit <delete> or any tag
-other than «file» (deletion and rename are handled by separate tools).
+never use "... rest unchanged" placeholders. Never emit any tag other than
+«file»; these tools only read, edit, and create file contents.
 
 Example A: add an int age field to Foo
 
@@ -533,6 +594,26 @@ Do NOT output «file» blocks or code fences unless the instruction specifically
 asks for code. Focus on answering the question or performing the analysis requested.
 """
 
+# Appended to EDIT_SYSTEM only when a Java/Kotlin file is the target (Task-021).
+# It costs nothing on non-Java calls and steers the model away from the exact
+# mistakes the Task-020 guards reject, so they fire less often.
+JAVA_RULES = """\
+Java/Kotlin file in play, so also:
+- Emit the package declaration that matches the file's directory; do not alter it.
+- Preserve every import and annotation. Never replace getters, setters,
+  constructors, or any member with a comment like "// getters and setters".
+- The public top-level type must match the filename (Foo.java -> public ... Foo).
+- Use idiomatic Spring: constructor injection; @Service/@Repository/@RestController
+  where implied; JPA annotations (@Entity, @Id, @GeneratedValue, @Column) on entities.
+"""
+
+
+def _edit_system_for(paths: list[str]) -> str:
+    """EDIT_SYSTEM, plus the Java rules block when any target is Java/Kotlin."""
+    if any(Path(p).suffix.lower() in _JAVA_EXTS for p in paths):
+        return f"{EDIT_SYSTEM}\n{JAVA_RULES}"
+    return EDIT_SYSTEM
+
 
 # ---------------------------------------------------------------------------
 # Output parsing
@@ -567,6 +648,7 @@ def _call_with_parse_retry(
     first_msg: str,
     fallback_files: list[str],
     num_predict: int | None = None,
+    system: str = EDIT_SYSTEM,
 ) -> tuple[dict[str, str] | None, str]:
     """
     Call the model with first_msg. If the output cannot be parsed into any
@@ -580,7 +662,7 @@ def _call_with_parse_retry(
     """
     try:
         raw = _call_model(
-            MODEL, [{"role": "user", "content": first_msg}], system=EDIT_SYSTEM,
+            MODEL, [{"role": "user", "content": first_msg}], system=system,
             num_ctx=NUM_CTX, num_predict=num_predict, temperature=TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
@@ -600,7 +682,7 @@ def _call_with_parse_retry(
     )
     try:
         raw = _call_model(
-            MODEL, [{"role": "user", "content": retry_msg}], system=EDIT_SYSTEM,
+            MODEL, [{"role": "user", "content": retry_msg}], system=system,
             num_ctx=NUM_CTX, num_predict=num_predict, temperature=TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
@@ -677,6 +759,45 @@ def _atomic_write(target: Path, content: bytes) -> None:
         raise
 
 
+def _read_context_blocks(
+    context_files: list[str], edit_tool: str
+) -> tuple[list[str] | None, str]:
+    """Read read-only reference files into «context» blocks for the prompt.
+
+    These are embedded for the model to consult but are NOT added to the
+    editable allowlist, so any block the model emits for them is rejected like
+    any other out-of-allowlist path. Same UTF-8/binary handling as the editable
+    files (Task-003). Returns (blocks, "") on success, or (None, error). (Task-012)
+    """
+    blocks: list[str] = []
+    for raw_path in context_files:
+        p = Path(raw_path)
+        if not p.exists():
+            return None, f"Error: context file not found: {raw_path}"
+        if not p.is_file():
+            return None, f"Error: context path is not a regular file: {raw_path}"
+        try:
+            lf, _eol, _raw = _read_file(p)
+        except UnicodeDecodeError:
+            return None, (
+                f"Error: context file {raw_path} is not UTF-8 text (binary or "
+                f"unknown encoding); use the built-in {edit_tool} tool for this file."
+            )
+        except OSError as e:
+            return None, f"Error reading context file {raw_path}: {e}"
+        blocks.append(f'«context path="{raw_path}"»\n{lf}\n«/context»')
+    return blocks, ""
+
+
+# Header that precedes «context» blocks so the model knows they are reference
+# material it must not rewrite. Only added when context_files are present, so it
+# costs nothing on the common no-context call. (Task-012)
+_CONTEXT_PREAMBLE = (
+    "The «context» blocks below are READ-ONLY references. Do NOT output them; "
+    "only output «file» blocks for files you actually changed.\n\n"
+)
+
+
 # ---------------------------------------------------------------------------
 # Input-size guard — pre-model-call validation
 # ---------------------------------------------------------------------------
@@ -690,17 +811,14 @@ _CHARS_PER_TOKEN = 3
 _PROMPT_OVERHEAD_TOKENS = 512
 
 
-def _check_input_size(
-    content: str, ctx_limit: int, label: str, reserve_output: bool = False
-) -> str | None:
+def _check_input_size(content: str, ctx_limit: int, label: str) -> str | None:
     """
-    Estimate the token count of *content* and reject if it will not fit.
+    Estimate the token count of *content* and reject if it will not fit as input.
 
-    In Ollama, num_ctx covers prompt PLUS completion. For paths that regenerate
-    a whole file (edit/write), pass reserve_output=True to also require room for
-    an output of roughly the same size, so a file that fits as input but cannot
-    be fully re-emitted is rejected up front instead of producing a truncated
-    output that later trips a guard. (Task-006)
+    In Ollama, num_ctx covers prompt PLUS completion. This checks only that the
+    input fits; reserving room for the OUTPUT (the regenerated editable files) is
+    done by the caller, which knows how much of the input will be re-emitted
+    versus consulted as read-only context. (Task-006, Task-012)
 
     Returns None if acceptable, or a human-readable error string.
     """
@@ -711,12 +829,6 @@ def _check_input_size(
             f"Error: {label} is too large to send to the model "
             f"(estimated ~{estimated_tokens} tokens; limit after overhead is "
             f"{available} of num_ctx={ctx_limit}). Use the built-in tools for this file."
-        )
-    if reserve_output and estimated_tokens * 2 > available:
-        return (
-            f"Error: {label} is too large to regenerate in one pass "
-            f"(input ~{estimated_tokens} tokens needs equal room for the output "
-            f"within num_ctx={ctx_limit}). Use the built-in Edit tool for this file."
         )
     return None
 
@@ -814,6 +926,394 @@ def _check_bracket_delta(new: str, original: str | None, ext: str) -> str | None
     return None
 
 
+def _java_placeholder_phrase(line: str) -> str | None:
+    """Reduce a comment-only line to its canonical placeholder phrase, or None.
+
+    Strips comment delimiters and filler (dots, parens/brackets, the article
+    "the") so that "// ... rest of the class ..." normalizes to "rest of class".
+    Returns None for any line that is not a pure comment.
+    """
+    if not _JAVA_COMMENT_PREFIX_RE.match(line):
+        return None
+    s = _JAVA_COMMENT_OPEN_RE.sub("", line.strip())
+    s = _JAVA_COMMENT_CLOSE_RE.sub("", s)
+    s = re.sub(r"[.()\[\]*/]", " ", s)
+    s = re.sub(r"\bthe\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s or None
+
+
+def _expected_java_package(path: str) -> str | None:
+    """Package a file should declare, derived from its path under a source root.
+
+    Returns the dotted package (possibly "" for a file directly in the root), or
+    None when no `src/{main,test}/{java,kotlin}` root is present in the path (so
+    the guard simply does not run for files outside a standard layout).
+    """
+    parts = Path(path).parts
+    lowered = [p.lower() for p in parts]
+    for root in _JAVA_SOURCE_ROOTS:
+        n = len(root)
+        for i in range(len(lowered) - n + 1):
+            if tuple(lowered[i:i + n]) == root:
+                return ".".join(parts[i + n:-1])
+    return None
+
+
+def _check_java(
+    new: str, original: str | None, path: str, instruction: str
+) -> list[str]:
+    """Java/Kotlin-specific guards (Task-020). No-op for other extensions.
+
+    Catches the dominant small-model failures on this verbose, top use-case:
+    omitted boilerplate, a package that contradicts the file location, a public
+    type that does not match the filename, and silently dropped imports.
+    """
+    ext = Path(path).suffix.lower()
+    if ext not in _JAVA_EXTS:
+        return []
+    failures: list[str] = []
+
+    # 1. Omission placeholders (delta against the original, like truncation markers)
+    original_phrases: set[str] = set()
+    if original is not None:
+        for line in original.splitlines():
+            ph = _java_placeholder_phrase(line)
+            if ph:
+                original_phrases.add(ph)
+    for line in new.splitlines():
+        ph = _java_placeholder_phrase(line)
+        if ph and ph in _JAVA_PLACEHOLDER_PHRASES and ph not in original_phrases:
+            failures.append(f"java omission placeholder on its own line: {line.strip()!r}")
+            break
+
+    # 2. Package must match the directory under a detected source root
+    expected = _expected_java_package(path)
+    if expected:
+        m = _PACKAGE_RE.search(new)
+        declared = m.group(1) if m else ""
+        if declared != expected:
+            failures.append(
+                f"package {declared!r} does not match location (expected {expected!r})"
+                if declared else f"missing package declaration (expected {expected!r})"
+            )
+
+    # 3. Public top-level type must match the filename (.java only; Kotlin allows
+    #    multiple top-level types and does not tie them to the filename)
+    if ext == ".java":
+        stem = Path(path).stem
+        if stem not in ("package-info", "module-info"):
+            m = _PUBLIC_TYPE_RE.search(new)
+            if m and m.group(1) != stem:
+                failures.append(
+                    f"public type {m.group(1)!r} does not match filename {stem!r}"
+                )
+
+    # 4. Import-loss heuristic (edit only; mirrors the shrink guard, scoped to
+    #    imports). Only fires on a material drop so removing one unused import is
+    #    not flagged.
+    if original is not None and not _instruction_allows_shrink(instruction):
+        old_imp = len(_IMPORT_LINE_RE.findall(original))
+        new_imp = len(_IMPORT_LINE_RE.findall(new))
+        if old_imp >= 4 and new_imp < old_imp * 0.7:
+            failures.append(
+                f"import count dropped {old_imp} -> {new_imp} with no removal keyword"
+            )
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Deterministic structural extraction (Task-023)
+# Turns a code file into a compact API skeleton (package, types, annotations,
+# fields, method signatures) with NO model call. Used by local_outline to answer
+# structural questions exactly, and by local_read to feed condensed context to
+# the model instead of full file bodies.
+# ---------------------------------------------------------------------------
+_OUTLINE_EXTS = {".java", ".py"}
+
+
+def _ts_text(code: bytes, node) -> str:
+    return code[node.start_byte:node.end_byte].decode("utf-8", "replace")
+
+
+def _ts_annotations(code: bytes, node) -> list[str]:
+    out: list[str] = []
+    for child in node.children:
+        if child.type == "modifiers":
+            for m in child.children:
+                if m.type in ("annotation", "marker_annotation"):
+                    out.append(_ts_text(code, m))
+    return out
+
+
+def _java_outline(lf_text: str) -> str | None:
+    """Compact Java API skeleton via tree-sitter, or None if unavailable/empty.
+
+    Emits the package, each type with its annotations, field declarations, and
+    method/constructor signatures (return type, name, parameters, annotations).
+    Method bodies are dropped, which is where almost all the bytes are.
+    """
+    if _JAVA_PARSER is None:
+        return None
+    code = lf_text.encode("utf-8")
+    tree = _JAVA_PARSER.parse(code)
+    lines: list[str] = []
+
+    pkg = re.search(r"^\s*package\s+([\w.]+)", lf_text, re.MULTILINE)
+    if pkg:
+        lines.append(f"package {pkg.group(1)}")
+
+    def emit(node, depth: int) -> None:
+        pad = "  " * depth
+        for child in node.children:
+            if child.type in ("class_declaration", "interface_declaration",
+                               "record_declaration", "enum_declaration"):
+                name = child.child_by_field_name("name")
+                anns = _ts_annotations(code, child)
+                ann_s = (" ".join(anns) + " ") if anns else ""
+                kind = child.type.split("_")[0]
+                nm = _ts_text(code, name) if name else "?"
+                # record_declaration carries its components like a param list
+                params = child.child_by_field_name("parameters")
+                psig = _ts_text(code, params) if params else ""
+                lines.append(f"{pad}{ann_s}{kind} {nm}{psig}")
+                body = child.child_by_field_name("body")
+                if body:
+                    emit(body, depth + 1)
+            elif child.type == "field_declaration":
+                anns = _ts_annotations(code, child)
+                ann_s = (" ".join(anns) + " ") if anns else ""
+                ftype = child.child_by_field_name("type")
+                decl = child.child_by_field_name("declarator")
+                fname = decl.child_by_field_name("name") if decl else None
+                if ftype and fname:
+                    lines.append(
+                        f"{pad}{ann_s}field {_ts_text(code, ftype)} {_ts_text(code, fname)}"
+                    )
+            elif child.type in ("method_declaration", "constructor_declaration"):
+                name = child.child_by_field_name("name")
+                params = child.child_by_field_name("parameters")
+                rtype = child.child_by_field_name("type")
+                anns = _ts_annotations(code, child)
+                ann_s = (" ".join(anns) + " ") if anns else ""
+                rt = (_ts_text(code, rtype) + " ") if rtype else ""
+                nm = _ts_text(code, name) if name else "?"
+                ps = _ts_text(code, params) if params else "()"
+                lines.append(f"{pad}{ann_s}{rt}{nm}{ps}")
+            else:
+                emit(child, depth)
+
+    emit(tree.root_node, 0)
+    body_lines = [ln for ln in lines if not ln.startswith("package ")]
+    return "\n".join(lines) if body_lines else None
+
+
+def _python_outline(lf_text: str) -> str | None:
+    """Compact Python API skeleton via the stdlib ast, or None on syntax error."""
+    try:
+        tree = ast.parse(lf_text)
+    except SyntaxError:
+        return None
+    lines: list[str] = []
+
+    def sig(fn: ast.AST) -> str:
+        try:
+            args = ast.unparse(fn.args)
+        except Exception:
+            args = "..."
+        ret = ""
+        if getattr(fn, "returns", None) is not None:
+            try:
+                ret = f" -> {ast.unparse(fn.returns)}"
+            except Exception:
+                ret = ""
+        kw = "async def" if isinstance(fn, ast.AsyncFunctionDef) else "def"
+        return f"{kw} {fn.name}({args}){ret}"
+
+    def decos(node: ast.AST, pad: str) -> None:
+        for d in getattr(node, "decorator_list", []):
+            try:
+                lines.append(f"{pad}@{ast.unparse(d)}")
+            except Exception:
+                pass
+
+    def emit(body: list[ast.stmt], depth: int) -> None:
+        pad = "  " * depth
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                bases = ", ".join(
+                    b for b in (_safe_unparse(x) for x in node.bases) if b
+                )
+                decos(node, pad)
+                lines.append(f"{pad}class {node.name}({bases})" if bases
+                             else f"{pad}class {node.name}")
+                emit(node.body, depth + 1)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                decos(node, pad)
+                lines.append(f"{pad}{sig(node)}")
+    emit(tree.body, 0)
+    return "\n".join(lines) if lines else None
+
+
+def _safe_unparse(node: ast.AST) -> str:
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return ""
+
+
+def _outline_text(path: str, lf_text: str) -> str | None:
+    """Dispatch to a language-specific outliner, or None if unsupported/empty."""
+    ext = Path(path).suffix.lower()
+    if ext == ".java":
+        return _java_outline(lf_text)
+    if ext == ".py":
+        return _python_outline(lf_text)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Map-reduce for oversized local_read inputs (Task-023)
+# The local model is free, so an input larger than one context window is handled
+# by summarizing each file/chunk in its own call and synthesizing the partials,
+# rather than refusing. Each partial is bounded so the synthesis stays small.
+# ---------------------------------------------------------------------------
+_MAPREDUCE_PARTIAL_NUM_PREDICT = 768
+_MAPREDUCE_FINAL_NUM_PREDICT = 1024
+
+
+def _read_model_call(content: str, num_predict: int | None) -> str:
+    return _strip_think_tags(_call_model(
+        MODEL, [{"role": "user", "content": _maybe_no_think(content)}],
+        system=READ_SYSTEM, num_ctx=NUM_CTX, num_predict=num_predict,
+        temperature=READ_TEMPERATURE,
+    ))
+
+
+def _chunk_by_lines(lf: str, char_budget: int) -> list[str]:
+    """Split text into chunks of at most char_budget chars, breaking on lines."""
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for ln in lf.splitlines(keepends=True):
+        if cur and cur_len + len(ln) > char_budget:
+            chunks.append("".join(cur))
+            cur, cur_len = [], 0
+        cur.append(ln)
+        cur_len += len(ln)
+    if cur:
+        chunks.append("".join(cur))
+    return chunks
+
+
+def _read_mapreduce(files_data: list[tuple[str, str]], instruction: str) -> str:
+    """Summarize each file/chunk in its own free local call, then synthesize.
+
+    Oversized files are first reduced to a deterministic skeleton when possible
+    (no extra model cost); only when even the skeleton will not fit is the raw
+    file chunked. Returns the final answer text, or an error string.
+    """
+    available = NUM_CTX - _PROMPT_OVERHEAD_TOKENS
+    map_char_budget = max(
+        1000, (available - _MAPREDUCE_PARTIAL_NUM_PREDICT) * _CHARS_PER_TOKEN
+    )
+    suffix = f"\n\nInstruction: {instruction}\n\nAnswer for THIS FILE ONLY, concisely."
+    partials: list[str] = []
+
+    for path, lf in files_data:
+        block = f'«file path="{path}"»\n{lf}\n«/file»'
+        try:
+            if len(block) + len(suffix) <= map_char_budget:
+                partials.append(
+                    f"=== {path} ===\n"
+                    + _read_model_call(block + suffix, _MAPREDUCE_PARTIAL_NUM_PREDICT)
+                )
+                continue
+            skel = _outline_text(path, lf)
+            if skel and len(skel) + len(suffix) <= map_char_budget:
+                content = (
+                    f'«outline path="{path}"»\n{skel}\n«/outline»'
+                    f"\n\nInstruction: {instruction}\n\nThis is a signatures-only "
+                    "skeleton (method bodies omitted). Answer for THIS FILE ONLY, concisely."
+                )
+                partials.append(
+                    f"=== {path} (outline) ===\n"
+                    + _read_model_call(content, _MAPREDUCE_PARTIAL_NUM_PREDICT)
+                )
+                continue
+            chunks = _chunk_by_lines(lf, map_char_budget - len(suffix))
+            for i, ch in enumerate(chunks):
+                content = f'«file path="{path}" part {i+1}/{len(chunks)}»\n{ch}\n«/file»' + suffix
+                partials.append(
+                    f"=== {path} part {i+1}/{len(chunks)} ===\n"
+                    + _read_model_call(content, _MAPREDUCE_PARTIAL_NUM_PREDICT)
+                )
+        except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
+            return f"Model call failed during map pass on {path}: {e}"
+
+    if len(partials) == 1:
+        head, _, body = partials[0].partition("\n")
+        return body or head
+
+    joined = "\n\n".join(partials)
+    reduce_msg = (
+        f"These are partial analyses of separate files/chunks:\n\n{joined}"
+        f"\n\nInstruction: {instruction}\n\nSynthesize ONE coherent answer to the "
+        "instruction. Do not repeat the per-file headers."
+    )
+    if _check_input_size(reduce_msg, NUM_CTX, "partial summaries") is None:
+        try:
+            return _read_model_call(reduce_msg, _MAPREDUCE_FINAL_NUM_PREDICT)
+        except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
+            return f"Model call failed during reduce pass: {e}"
+    # Too many partials to synthesize in one pass: return them as-is.
+    return joined
+
+
+# ---------------------------------------------------------------------------
+# local_outline
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def local_outline(files: list[str]) -> str:
+    """Return a compact API skeleton (package, types, annotations, fields, method
+    signatures; no bodies) for .java/.py files. DETERMINISTIC, no model call.
+    Use instead of local_read/Read when you need an interface or shape, not
+    implementations: a few hundred tokens instead of the whole file.
+
+    Args:
+        files: absolute paths to outline.
+    """
+    sections: list[str] = []
+    for raw_path in files:
+        p = Path(raw_path)
+        if not p.exists():
+            return f"Error: file not found: {raw_path}"
+        if not p.is_file():
+            return f"Error: not a regular file: {raw_path}"
+        if p.suffix.lower() not in _OUTLINE_EXTS:
+            return (
+                f"Error: local_outline supports {sorted(_OUTLINE_EXTS)} only; "
+                f"{raw_path} is unsupported. Use local_read for prose analysis."
+            )
+        try:
+            lf, _eol, _raw = _read_file(p)
+        except UnicodeDecodeError:
+            return f"Error: {raw_path} is not UTF-8 text."
+        except OSError as e:
+            return f"Error reading {raw_path}: {e}"
+        skel = _outline_text(raw_path, lf)
+        if skel is None:
+            if p.suffix.lower() == ".java" and _JAVA_PARSER is None:
+                return (
+                    "Error: Java outline needs tree-sitter, which is not installed. "
+                    "Run via 'uv run server.py' (it declares the dependency) or use local_read."
+                )
+            return f"Error: could not extract an outline from {raw_path} (syntax error or empty)."
+        sections.append(f"{raw_path}\n{skel}")
+    return "\n\n".join(sections)
+
+
 # ---------------------------------------------------------------------------
 # local_read
 # ---------------------------------------------------------------------------
@@ -838,7 +1338,7 @@ def local_read(files: list[str], instruction: str) -> str:
             "local_read is for analysis tasks (summarize, review, find patterns)."
         )
 
-    file_blocks: list[str] = []
+    files_data: list[tuple[str, str]] = []
     for raw_path in files:
         p = Path(raw_path)
         if not p.exists():
@@ -854,16 +1354,18 @@ def local_read(files: list[str], instruction: str) -> str:
             )
         except OSError as e:
             return f"Error reading {raw_path}: {e}"
-        file_blocks.append(f'«file path="{raw_path}"»\n{lf}\n«/file»')
+        files_data.append((raw_path, lf))
 
+    file_blocks = [f'«file path="{path}"»\n{lf}\n«/file»' for path, lf in files_data]
     user_msg = "\n\n".join(file_blocks) + f"\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
 
-    size_err = _check_input_size(user_msg, NUM_CTX, f"{len(files)} file(s)")
-    if size_err:
-        return size_err
-
     chosen = MODEL
+    # When everything fits in one context, a single pass is cheapest. Otherwise
+    # map-reduce over free local calls instead of refusing the input. (Task-023)
+    if _check_input_size(user_msg, NUM_CTX, f"{len(files)} file(s)") is not None:
+        return _read_mapreduce(files_data, instruction)
+
     try:
         raw = _call_model(
             chosen,
@@ -881,7 +1383,9 @@ def local_read(files: list[str], instruction: str) -> str:
 # local_edit
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def local_edit(files: list[str], instruction: str) -> str:
+def local_edit(
+    files: list[str], instruction: str, context_files: list[str] | None = None
+) -> str:
     """Edit existing files locally instead of the built-in Edit tool: file
     contents never enter Claude's context. Validates each change server-side and
     applies atomically. Call sequentially (single GPU).
@@ -891,6 +1395,9 @@ def local_edit(files: list[str], instruction: str) -> str:
         instruction: the change (any language; translated). Include a removal
             verb (delete/remove/strip/...) for a large size reduction, or the
             shrink guard rejects.
+        context_files: optional absolute paths the model may READ for reference
+            (interfaces, callers, constants) but must NOT edit. Lets a cross-file
+            edit succeed without those files entering Claude's context.
     """
     # 0. Normalize instruction to English (no-op if already English)
     instruction = _normalize_instruction(instruction)
@@ -918,28 +1425,52 @@ def local_edit(files: list[str], instruction: str) -> str:
 
     chosen = MODEL
 
+    # 1b. Read read-only context files (consulted, never editable). (Task-012)
+    context_block = ""
+    if context_files:
+        ctx_blocks, ctx_err = _read_context_blocks(context_files, "Edit")
+        if ctx_blocks is None:
+            return ctx_err
+        context_block = _CONTEXT_PREAMBLE + "\n\n".join(ctx_blocks) + "\n\n"
+
     # 2. Build prompt — embed LF-normalized contents
     files_block = "\n\n".join(
         f'«file path="{path}"»\n{originals[path][0]}\n«/file»'
         for path in files
     )
-    user_msg = f"{files_block}\n\nInstruction: {instruction}"
+    user_msg = f"{context_block}{files_block}\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
 
-    size_err = _check_input_size(
-        user_msg, NUM_CTX, f"{len(files)} file(s)", reserve_output=True
-    )
+    label = f"{len(files)} file(s)"
+    if context_files:
+        label += f" + {len(context_files)} context file(s)"
+
+    # The whole prompt (editable + context) must fit as input.
+    size_err = _check_input_size(user_msg, NUM_CTX, label)
     if size_err:
         return size_err
 
-    # Give the model room to emit the full file(s) but not ramble unbounded:
-    # cap num_predict at the context left after the input. (Task-006)
+    # Reserve room for the OUTPUT, which is only the editable files regenerated
+    # in full (context files are never re-emitted). cap num_predict at the
+    # context left after the whole input; reject if that is not enough to
+    # re-emit the editable files. (Task-006, generalized for context in Task-012)
     estimated_input = len(user_msg) // _CHARS_PER_TOKEN
+    editable_output_tokens = sum(len(originals[p][0]) for p in files) // _CHARS_PER_TOKEN
     edit_num_predict = max(256, (NUM_CTX - _PROMPT_OVERHEAD_TOKENS) - estimated_input)
+    if edit_num_predict < editable_output_tokens:
+        return (
+            f"Error: {label} too large to regenerate in one pass "
+            f"(input ~{estimated_input} tokens leaves room for ~{edit_num_predict} "
+            f"output tokens, but the editable files need ~{editable_output_tokens} "
+            f"within num_ctx={NUM_CTX}). Use the built-in Edit tool, or pass fewer "
+            "context files."
+        )
 
-    # 3. Call model (with one automatic retry on parse failure)
+    # 3. Call model (with one automatic retry on parse failure). Java/Kotlin
+    #    targets get the Java rules appended to the system prompt. (Task-021)
     file_changes_raw, err = _call_with_parse_retry(
-        user_msg, files, num_predict=edit_num_predict
+        user_msg, files, num_predict=edit_num_predict,
+        system=_edit_system_for(files),
     )
     if file_changes_raw is None:
         return f"[{chosen}] {err}"
@@ -982,6 +1513,8 @@ def local_edit(files: list[str], instruction: str) -> str:
         ):
             if check:
                 failures.append(f"{path}: {check}")
+        for jcheck in _check_java(new_content, original_lf, path, instruction):
+            failures.append(f"{path}: {jcheck}")
 
     if failures:
         return (
@@ -1027,7 +1560,9 @@ def local_edit(files: list[str], instruction: str) -> str:
 # local_write
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def local_write(path: str, instruction: str) -> str:
+def local_write(
+    path: str, instruction: str, context_files: list[str] | None = None
+) -> str:
     """Create a NEW file locally instead of the built-in Write tool. Worth it
     only when the instruction is much shorter than the output (stubs,
     boilerplate, scaffolds). Refuses to overwrite (use local_edit). Call
@@ -1036,6 +1571,9 @@ def local_write(path: str, instruction: str) -> str:
     Args:
         path: absolute path to create.
         instruction: concise spec (any language; translated server-side).
+        context_files: optional absolute paths the model may READ for reference
+            (an interface to implement, a sibling to match) but must NOT write,
+            without those files entering Claude's context.
     """
     target = Path(path)
     if target.exists():
@@ -1044,13 +1582,30 @@ def local_write(path: str, instruction: str) -> str:
     instruction = _normalize_instruction(instruction)
     chosen = MODEL
 
+    context_block = ""
+    if context_files:
+        ctx_blocks, ctx_err = _read_context_blocks(context_files, "Write")
+        if ctx_blocks is None:
+            return ctx_err
+        context_block = _CONTEXT_PREAMBLE + "\n\n".join(ctx_blocks) + "\n\n"
+
     user_msg = (
+        f"{context_block}"
         f'Create a new file at the absolute path "{path}".\n\n'
         f"Instruction: {instruction}"
     )
     user_msg = _maybe_no_think(user_msg)
 
-    file_changes_raw, err = _call_with_parse_retry(user_msg, [path])
+    if context_files:
+        size_err = _check_input_size(
+            user_msg, NUM_CTX, f"{len(context_files)} context file(s)"
+        )
+        if size_err:
+            return size_err
+
+    file_changes_raw, err = _call_with_parse_retry(
+        user_msg, [path], system=_edit_system_for([path])
+    )
     if file_changes_raw is None:
         return f"[{chosen}] {err}"
 
@@ -1077,6 +1632,8 @@ def local_write(path: str, instruction: str) -> str:
     ):
         if check:
             failures.append(f"{path}: {check}")
+    for jcheck in _check_java(content, None, path, instruction):
+        failures.append(f"{path}: {jcheck}")
     if failures:
         return (
             f"[{chosen}] REJECTED — guard-rail failures:\n"

@@ -57,6 +57,7 @@ Route file operations to save tokens. With local-mcp tools, file contents stay s
 
 | Task | Tool | Notes |
 |------|------|-------|
+| Need an interface / signatures, not bodies | ``local_outline`` | Deterministic, no model call; a few hundred tokens vs the whole file. Prefer over ``Read`` for "what does this class expose" (.java/.py). |
 | Edit (file not in context) | ``local_edit`` | Sends paths + instruction; file never enters Claude context. |
 | Edit (file in context / small fix) | ``Edit`` | Diff-only; cheaper and more reliable than an external model call. |
 | Create new files | ``local_write`` | Only when instruction is much shorter than the output. Use ``Write`` for dictated content. |
@@ -64,6 +65,8 @@ Route file operations to save tokens. With local-mcp tools, file contents stay s
 | Short snippets (no file dest) | ``local_snippet`` | Output costs Claude tokens. Use sparingly. |
 
 Delete and rename are not local-mcp tools (they save no tokens); use the built-in tools or ``Bash``.
+
+**Spring/Java boilerplate** (JPA entity, Spring Data repository, ``@RestController`` + DTO, ``@Service``, ``@Configuration`` bean, mapper, test stub) from a one-line spec -> ``local_write``: the large annotated output never enters Claude's context.
 
 **Trust tool results.** Do not re-read files to verify unless the tool returned ``REJECTED`` or ``Error``.
 $EndMarker
