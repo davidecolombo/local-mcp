@@ -32,6 +32,7 @@ ENV/
 
 # Logs
 *.log
+local-mcp.log*
 logs/
 
 # Test / coverage reports

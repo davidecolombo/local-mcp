@@ -9,7 +9,7 @@
 # ]
 # ///
 """
-Local MCP Server — routes implementation work to local Ollama models.
+Local MCP Server: routes implementation work to local Ollama models.
 
 The goal is to save Claude tokens: file contents are read, edited, and written
 back entirely on the server side, so they almost never round-trip through
@@ -45,12 +45,14 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import os
 import re
 import tempfile
 import threading
 import time
 import concurrent.futures
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import httpx
@@ -75,7 +77,45 @@ except Exception:
 mcp = FastMCP("local-mcp")
 
 # ---------------------------------------------------------------------------
-# Model configuration — loaded from model-config.json (optional).
+# Opt-in debug logging (Task-008). Off by default and fully silent: a single
+# NullHandler, nothing written to disk, nothing on stdout/stderr (stdout carries
+# the MCP protocol and must never be touched). Enable with LOCAL_MCP_DEBUG=1 (or
+# "log_level": "DEBUG" in model-config.json); output then goes to a rotating
+# local-mcp.log next to this file. File bodies are only ever logged here, so
+# normal operation stays quiet and private.
+# ---------------------------------------------------------------------------
+_log = logging.getLogger("local-mcp")
+_log.propagate = False
+_log.addHandler(logging.NullHandler())
+_log.setLevel(logging.WARNING)
+
+
+def _enable_debug_logging() -> None:
+    """Attach a rotating file handler at DEBUG. Idempotent."""
+    if any(isinstance(h, RotatingFileHandler) for h in _log.handlers):
+        return
+    logfile = Path(__file__).resolve().parent / "local-mcp.log"
+    handler = RotatingFileHandler(
+        logfile, maxBytes=1_000_000, backupCount=2, encoding="utf-8", delay=True
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _log.addHandler(handler)
+    _log.setLevel(logging.DEBUG)
+
+
+def _bound(text: str, limit: int = 2000) -> str:
+    """Bound a value for logging so the log file cannot blow up."""
+    text = str(text)
+    return text if len(text) <= limit else f"{text[:limit]}... [+{len(text) - limit} chars]"
+
+
+# Env var can enable debug BEFORE the config is read, so a malformed config file
+# is itself logged. The config's log_level is honored too, just after load.
+if os.environ.get("LOCAL_MCP_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
+    _enable_debug_logging()
+
+# ---------------------------------------------------------------------------
+# Model configuration; loaded from model-config.json (optional).
 # See configs/ for ready-to-use templates.
 # ---------------------------------------------------------------------------
 _CONFIG_DEFAULTS: dict = {
@@ -117,6 +157,10 @@ _CONFIG_DEFAULTS: dict = {
     # ONLY the wait to start, not generation; once a call begins streaming,
     # the per-chunk `timeout` above governs it. (Task-004)
     "queue_timeout": 300,
+    # "WARNING" (default, silent) or "DEBUG" to trace to local-mcp.log. The
+    # LOCAL_MCP_DEBUG=1 env var does the same and applies even before this file
+    # is read. (Task-008)
+    "log_level": "WARNING",
 }
 
 
@@ -141,12 +185,17 @@ def _load_model_config() -> dict:
                 # dropped because varying num_ctx reloads the model (Task-022).
                 if "num_ctx" not in user_cfg and "edit_ctx" in user_cfg:
                     cfg["num_ctx"] = user_cfg["edit_ctx"]
-        except (json.JSONDecodeError, OSError):
-            pass  # Malformed or unreadable — use defaults silently
+        except (json.JSONDecodeError, OSError) as e:
+            # Use defaults, but leave a trace (visible only when debug is on).
+            _log.warning("malformed model-config.json (%s); using defaults", e)
     return cfg
 
 
 _cfg = _load_model_config()
+
+# The config can enable debug too (env var already handled above).
+if str(_cfg.get("log_level", "")).upper() == "DEBUG":
+    _enable_debug_logging()
 
 PROVIDER: str              = _cfg["provider"]
 MODEL: str                 = _cfg["model"]
@@ -214,7 +263,7 @@ _RETRIEVAL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Lazy-output markers — matched as WHOLE TRIMMED LINES, and only flagged when
+# Lazy-output markers; matched as WHOLE TRIMMED LINES, and only flagged when
 # the same line was NOT already present in the original file. Whole-line +
 # delta-against-original keeps false positives near zero.
 TRUNCATION_MARKERS = (
@@ -569,7 +618,7 @@ def _is_probably_english(text: str) -> bool:
     Cheap, conservative English detector. Returns True if the text looks like
     English. Errs toward True (no translation) so the common case is free.
     Returns False on:
-      - any non-ASCII Latin letter (à, é, ñ, ö, ß, ç, …)
+      - any non-ASCII Latin letter (à, é, ñ, ö, ß, ç, ...)
       - any token in _NON_ENGLISH_MARKERS
     """
     for ch in text:
@@ -587,7 +636,7 @@ def _normalize_instruction(instruction: str) -> str:
     If the instruction is not English, translate it to English using the same
     local model. This collapses every guard-rail into an English-only problem
     and improves model output quality (qwen3-coder is stronger on English
-    instructions). On translation failure, return the original — better to
+    instructions). On translation failure, return the original; better to
     attempt the edit than to hard-fail on a translation glitch.
     """
     if _is_probably_english(instruction):
@@ -597,7 +646,7 @@ def _normalize_instruction(instruction: str) -> str:
             MODEL,
             [{"role": "user", "content": (
                 "Translate the following instruction to English. Output ONLY "
-                "the translation as plain text — no preamble, no quotes, no "
+                "the translation as plain text; no preamble, no quotes, no "
                 "explanation, no markdown.\n\n"
                 f"{_maybe_no_think(instruction)}"
             )}],
@@ -605,9 +654,11 @@ def _normalize_instruction(instruction: str) -> str:
             num_predict=TRANSLATE_NUM_PREDICT,
             temperature=TEMPERATURE,
         )
-    except httpx.HTTPError:
+    except httpx.HTTPError as e:
+        _log.warning("translation failed (%s); using original instruction", e)
         return instruction
     cleaned = _strip_think_tags(translated).strip()
+    _log.debug("translated instruction: %r -> %r", instruction, cleaned)
     return cleaned or instruction
 
 
@@ -719,7 +770,7 @@ def _call_with_parse_retry(
     Call the model with first_msg. If the output cannot be parsed into any
     «file» block (nor a markdown-fenced fallback), retry ONCE with a stricter
     user message that tells the model its previous output was malformed. If
-    the retry also fails, return a bounded error — the raw output is truncated
+    the retry also fails, return a bounded error; the raw output is truncated
     to PARSE_FAIL_ECHO_LIMIT chars so the caller's context is not blown up.
 
     Returns (changes, error). On success, error is ''. On failure, changes is
@@ -733,6 +784,7 @@ def _call_with_parse_retry(
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return None, f"Model call failed: {e}"
     raw = _strip_think_tags(raw)
+    _log.debug("model raw output (%d chars): %s", len(raw), _bound(raw))
 
     changes = _extract_file_changes(raw, fallback_files)
     if changes:
@@ -740,6 +792,7 @@ def _call_with_parse_retry(
 
     # Retry with a stricter prompt. We keep the same system prompt and resend
     # the original task, but prepend a hard instruction about format.
+    _log.warning("parse-retry: no «file» blocks in first output; retrying once")
     retry_msg = (
         "Previous output was MALFORMED and unparseable. "
         "Output ONLY «file» blocks. Try again.\n\n"
@@ -753,11 +806,13 @@ def _call_with_parse_retry(
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
         return None, f"Model call failed on retry: {e}"
     raw = _strip_think_tags(raw)
+    _log.debug("model raw output on retry (%d chars): %s", len(raw), _bound(raw))
 
     changes = _extract_file_changes(raw, fallback_files)
     if changes:
         return changes, ""
 
+    _log.warning("parse failure persisted after retry; surfacing bounded error")
     truncated = raw[:PARSE_FAIL_ECHO_LIMIT]
     if len(raw) > PARSE_FAIL_ECHO_LIMIT:
         truncated += f"\n... [{len(raw) - PARSE_FAIL_ECHO_LIMIT} more chars truncated]"
@@ -775,7 +830,7 @@ def _norm_path(p: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# File I/O — preserves original line endings (CRLF on Windows must NOT be
+# File I/O; preserves original line endings (CRLF on Windows must NOT be
 # silently rewritten to LF on every edit).
 # ---------------------------------------------------------------------------
 def _read_file(path: Path) -> tuple[str, bytes, bytes]:
@@ -807,7 +862,7 @@ def _encode_with_eol(lf_text: str, eol: bytes) -> bytes:
 def _atomic_write(target: Path, content: bytes) -> None:
     """
     Atomic write on Windows: temp file in the SAME directory, then os.replace.
-    Raises PermissionError/OSError on locked or unwritable files — caller handles those.
+    Raises PermissionError/OSError on locked or unwritable files; caller handles those.
     """
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -864,7 +919,7 @@ _CONTEXT_PREAMBLE = (
 
 
 # ---------------------------------------------------------------------------
-# Input-size guard — pre-model-call validation
+# Input-size guard; pre-model-call validation
 # ---------------------------------------------------------------------------
 # Conservative character-per-token ratio. Code typically runs 3-4 chars/token;
 # using 3 over-estimates token usage, providing a safety margin.
@@ -899,7 +954,7 @@ def _check_input_size(content: str, ctx_limit: int, label: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Guard-rails — pre-write validation
+# Guard-rails; pre-write validation
 # ---------------------------------------------------------------------------
 def _instruction_allows_shrink(instruction: str) -> bool:
     low = instruction.lower()
@@ -934,7 +989,7 @@ def _check_shrink(new: str, original: str, instruction: str) -> str | None:
     if _instruction_allows_shrink(instruction):
         return None
     return (
-        f"suspicious shrink ({len(original)} → {len(new)} chars, "
+        f"suspicious shrink ({len(original)} -> {len(new)} chars, "
         f"instruction had no removal keyword)"
     )
 
@@ -953,7 +1008,7 @@ def _check_parses(content: str, ext: str) -> str | None:
     the new content and reject on syntax errors. This catches mid-stream
     truncation and malformed edits that the bracket-delta heuristic misses
     (e.g. unterminated strings, stray indentation, missing commas in JSON).
-    Only runs for .py and .json — adding JS/TS would require shelling out.
+    Only runs for .py and .json; adding JS/TS would require shelling out.
     """
     ext = ext.lower()
     if ext == ".py":
@@ -975,7 +1030,7 @@ def _check_bracket_delta(new: str, original: str | None, ext: str) -> str | None
         return None
     new_d = _bracket_delta(new)
     if original is None:
-        # Absolute balance check (used by local_write — no original to diff against)
+        # Absolute balance check (used by local_write; no original to diff against)
         if new_d != (0, 0, 0):
             return (
                 f"unbalanced brackets in new file: "
@@ -1400,7 +1455,7 @@ def local_read(files: list[str], instruction: str) -> str:
     if _RETRIEVAL_RE.search(instruction):
         return (
             "Error: local_read cannot be used for verbatim file retrieval. "
-            "Use the built-in Read tool instead — it reads the file directly "
+            "Use the built-in Read tool instead; it reads the file directly "
             "into context without a local-model round-trip. "
             "local_read is for analysis tasks (summarize, review, find patterns)."
         )
@@ -1427,7 +1482,6 @@ def local_read(files: list[str], instruction: str) -> str:
     user_msg = "\n\n".join(file_blocks) + f"\n\nInstruction: {instruction}"
     user_msg = _maybe_no_think(user_msg)
 
-    chosen = MODEL
     # When everything fits in one context, a single pass is cheapest. Otherwise
     # map-reduce over free local calls instead of refusing the input. (Task-023)
     if _check_input_size(user_msg, NUM_CTX, f"{len(files)} file(s)") is not None:
@@ -1435,7 +1489,7 @@ def local_read(files: list[str], instruction: str) -> str:
 
     try:
         raw = _call_model(
-            chosen,
+            MODEL,
             [{"role": "user", "content": user_msg}],
             system=READ_SYSTEM,
             num_ctx=NUM_CTX,
@@ -1443,7 +1497,7 @@ def local_read(files: list[str], instruction: str) -> str:
             temperature=READ_TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
-        return f"[{chosen}] Model call failed: {e}"
+        return f"[{MODEL}] Model call failed: {e}"
     return _strip_think_tags(raw)
 
 
@@ -1491,8 +1545,6 @@ def local_edit(
         originals[raw_path] = (lf, eol, raw)
         canonical[_norm_path(raw_path)] = raw_path
 
-    chosen = MODEL
-
     # 1b. Read read-only context files (consulted, never editable). (Task-012)
     context_block = ""
     if context_files:
@@ -1501,7 +1553,7 @@ def local_edit(
             return ctx_err
         context_block = _CONTEXT_PREAMBLE + "\n\n".join(ctx_blocks) + "\n\n"
 
-    # 2. Build prompt — embed LF-normalized contents
+    # 2. Build prompt; embed LF-normalized contents
     files_block = "\n\n".join(
         f'«file path="{path}"»\n{originals[path][0]}\n«/file»'
         for path in files
@@ -1512,6 +1564,11 @@ def local_edit(
     label = f"{len(files)} file(s)"
     if context_files:
         label += f" + {len(context_files)} context file(s)"
+
+    _log.debug(
+        "local_edit: model=%s files=%s context=%s instruction=%r",
+        MODEL, files, context_files or [], _bound(instruction, 300),
+    )
 
     # The whole prompt (editable + context) must fit as input.
     size_err = _check_input_size(user_msg, NUM_CTX, label)
@@ -1541,9 +1598,9 @@ def local_edit(
         system=_edit_system_for(files),
     )
     if file_changes_raw is None:
-        return f"[{chosen}] {err}"
+        return f"[{MODEL}] {err}"
 
-    # 5. Resolve emitted paths against the allowlist (Windows-aware normalize)
+    # 4. Resolve emitted paths against the allowlist (Windows-aware normalize)
     file_changes: dict[str, str] = {}
     unknown: list[str] = []
     for emitted_path, content in file_changes_raw.items():
@@ -1554,20 +1611,21 @@ def local_edit(
         file_changes[canonical[norm]] = content
 
     if unknown:
+        _log.debug("rejected out-of-allowlist paths: %s", unknown)
         return (
-            f"[{chosen}] REJECTED — model emitted paths not in the input allowlist:\n"
-            + "\n".join(f"  • {p}" for p in unknown)
+            f"[{MODEL}] REJECTED; model emitted paths not in the input allowlist:\n"
+            + "\n".join(f"  - {p}" for p in unknown)
             + "\nNo files were modified."
         )
 
-    # 6. Identity no-op: silently drop unchanged files
+    # 5. Identity no-op: silently drop unchanged files
     no_ops: list[str] = []
     for path in list(file_changes.keys()):
         if file_changes[path] == originals[path][0]:
             no_ops.append(path)
             del file_changes[path]
 
-    # 7. Run guards on remaining file changes
+    # 6. Run guards on remaining file changes
     failures: list[str] = []
     for path, new_content in file_changes.items():
         original_lf = originals[path][0]
@@ -1585,16 +1643,24 @@ def local_edit(
             failures.append(f"{path}: {jcheck}")
 
     if failures:
+        _log.debug(
+            "guard rejections: %s; rejected content: %s",
+            failures, {p: _bound(c, 500) for p, c in file_changes.items()},
+        )
         return (
-            f"[{chosen}] REJECTED — guard-rail failures:\n"
-            + "\n".join(f"  • {f}" for f in failures)
+            f"[{MODEL}] REJECTED; guard-rail failures:\n"
+            + "\n".join(f"  - {f}" for f in failures)
             + "\nNo files were modified."
         )
 
     if not file_changes:
+        _log.debug(
+            "no-op: all emitted content matched originals (unchanged=%s)",
+            [Path(p).name for p in no_ops],
+        )
         return "No changes proposed (model output matched originals)."
 
-    # 8. Atomic apply with revert on failure
+    # 7. Atomic apply with revert on failure
     written: list[str] = []
     try:
         for path, new_content in file_changes.items():
@@ -1611,8 +1677,9 @@ def local_edit(
         msg = str(e)
         if isinstance(e, PermissionError):
             msg = f"file is locked or not writable ({e})"
+        _log.warning("write failed (%s); reverted %d file(s)", e, len(written))
         return (
-            f"[{chosen}] REJECTED during apply — {msg}\n"
+            f"[{MODEL}] REJECTED during apply; {msg}\n"
             f"All successful writes have been reverted. No files modified."
         )
 
@@ -1621,6 +1688,7 @@ def local_edit(
     summary = f"Modified {len(file_changes)} file(s)."
     if no_ops:
         summary += " Unchanged: " + ", ".join(Path(p).name for p in no_ops)
+    _log.debug("local_edit applied: %s (written=%s)", summary, written)
     return summary
 
 
@@ -1648,7 +1716,6 @@ def local_write(
         return f"Error: path already exists (use local_edit instead): {path}"
 
     instruction = _normalize_instruction(instruction)
-    chosen = MODEL
 
     context_block = ""
     if context_files:
@@ -1675,22 +1742,22 @@ def local_write(
         user_msg, [path], system=_edit_system_for([path])
     )
     if file_changes_raw is None:
-        return f"[{chosen}] {err}"
+        return f"[{MODEL}] {err}"
 
     if len(file_changes_raw) != 1:
         return (
-            f"[{chosen}] REJECTED — local_write expects exactly 1 «file» block, "
+            f"[{MODEL}] REJECTED; local_write expects exactly 1 «file» block, "
             f"got {len(file_changes_raw)}."
         )
 
     emitted_path, content = next(iter(file_changes_raw.items()))
     if _norm_path(emitted_path) != _norm_path(path):
         return (
-            f"[{chosen}] REJECTED — model wrote to a different path than requested.\n"
+            f"[{MODEL}] REJECTED; model wrote to a different path than requested.\n"
             f"  requested: {path}\n  emitted:   {emitted_path}"
         )
 
-    # Guards (no original — use absolute bracket balance)
+    # Guards (no original; use absolute bracket balance)
     failures: list[str] = []
     for check in (
         _check_non_empty(content),
@@ -1704,8 +1771,8 @@ def local_write(
         failures.append(f"{path}: {jcheck}")
     if failures:
         return (
-            f"[{chosen}] REJECTED — guard-rail failures:\n"
-            + "\n".join(f"  • {f}" for f in failures)
+            f"[{MODEL}] REJECTED; guard-rail failures:\n"
+            + "\n".join(f"  - {f}" for f in failures)
             + "\nFile was not created."
         )
 
@@ -1714,7 +1781,7 @@ def local_write(
         _atomic_write(target, _encode_with_eol(content, b"\n"))
     except OSError as e:
         msg = f"file is locked or not writable ({e})" if isinstance(e, PermissionError) else str(e)
-        return f"[{chosen}] REJECTED during apply — {msg}\nFile was not created."
+        return f"[{MODEL}] REJECTED during apply; {msg}\nFile was not created."
 
     line_count = content.count("\n") + (0 if content.endswith("\n") else 1)
     return f"Created {path} ({line_count} lines)"
@@ -1733,7 +1800,6 @@ def local_snippet(prompt: str) -> str:
         prompt: the task (any language; translated server-side).
     """
     prompt = _normalize_instruction(prompt)
-    chosen = MODEL
     snippet_system = (
         "Terse code/snippet generator. Output ONLY the bare artifact (the code, "
         "regex, query, or text) and nothing else: no prose, no explanation, no "
@@ -1742,7 +1808,7 @@ def local_snippet(prompt: str) -> str:
     full_prompt = _maybe_no_think(prompt)
     try:
         raw = _call_model(
-            chosen,
+            MODEL,
             [{"role": "user", "content": full_prompt}],
             system=snippet_system,
             num_ctx=NUM_CTX,
@@ -1750,7 +1816,7 @@ def local_snippet(prompt: str) -> str:
             temperature=READ_TEMPERATURE,
         )
     except httpx.HTTPError as e:
-        return f"[{chosen}] Model call failed: {e}"
+        return f"[{MODEL}] Model call failed: {e}"
     return _strip_think_tags(raw)
 
 

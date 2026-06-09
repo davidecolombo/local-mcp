@@ -132,6 +132,7 @@ Copy a template to `model-config.json` to switch models.
 | `top_p` / `top_k` / `seed` / `num_gpu` | `null` | Optional; when null the model's own default applies. |
 | `timeout` | `1200` | Seconds; per-chunk for streaming Ollama, total for OpenRouter. |
 | `queue_timeout` | `300` | Seconds to wait in the single-worker queue before giving up (bounds the wait, not generation). |
+| `log_level` | `"WARNING"` | `"DEBUG"` traces to `local-mcp.log`. Equivalent to the `LOCAL_MCP_DEBUG=1` env var. |
 
 For OpenRouter, also set `openrouter_url`, `openrouter_referer`, `openrouter_title`, `openrouter_extra_body`, and `OPENROUTER_API_KEY` env var. `num_ctx` is ignored for OpenRouter (the remote endpoint decides context).
 
@@ -173,6 +174,14 @@ The most common first-run failures return a one-line, actionable message instead
 - **OpenRouter**: connection failures and `401/403/404` responses include the likely fix (check `OPENROUTER_API_KEY`, verify the model slug).
 
 A transient HTTP 500 while a cold model loads is retried once automatically before the error is surfaced.
+
+### Debug logging
+
+The server is silent by default (no log file, nothing on stdout/stderr, so the MCP stdio protocol is never disturbed). To trace why a result occurred (a no-op, a guard rejection, an ignored config, what the model actually returned), set `LOCAL_MCP_DEBUG=1` (or `"log_level": "DEBUG"` in `model-config.json`) and re-run. Output goes to a rotating `local-mcp.log` next to `server.py` (gitignored). File contents are only ever written there, never at the default level.
+
+```powershell
+$env:LOCAL_MCP_DEBUG = "1"   # then restart the MCP server
+```
 
 ## License
 
