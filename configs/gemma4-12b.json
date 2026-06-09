@@ -2,6 +2,7 @@
   "model": "gemma4:12b",
   "ollama_url": "http://localhost:11434/api/chat",
   "num_ctx": 65536,
+  "read_num_predict": 1024,
   "snippet_num_predict": 2048,
   "translate_num_predict": 1024,
   "temperature": 0,

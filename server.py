@@ -49,6 +49,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import concurrent.futures
 from pathlib import Path
 
@@ -93,7 +94,10 @@ _CONFIG_DEFAULTS: dict = {
     # keep_alive, so snippet/translate no longer use smaller contexts. (Task-022)
     "num_ctx": 32768,
     # Max output tokens per call type. num_predict is a runtime parameter; it
-    # does NOT trigger a reload, so it can vary freely.
+    # does NOT trigger a reload, so it can vary freely. read_num_predict bounds
+    # local_read: its output is the only cost that tool pays back into Claude's
+    # context, so it must not run away. (Task-014)
+    "read_num_predict": 1024,
     "snippet_num_predict": 1024,
     "translate_num_predict": 512,
     # Sampling. temperature 0 keeps full-file regeneration deterministic and
@@ -152,6 +156,7 @@ OPENROUTER_REFERER: str    = _cfg["openrouter_referer"]
 OPENROUTER_TITLE: str      = _cfg["openrouter_title"]
 OPENROUTER_EXTRA_BODY: dict = _cfg["openrouter_extra_body"]
 NUM_CTX: int               = _cfg["num_ctx"]
+READ_NUM_PREDICT: int      = _cfg["read_num_predict"]
 SNIPPET_NUM_PREDICT: int   = _cfg["snippet_num_predict"]
 TRANSLATE_NUM_PREDICT: int = _cfg["translate_num_predict"]
 TEMPERATURE                = _cfg["temperature"]
@@ -284,6 +289,59 @@ _IMPORT_LINE_RE = re.compile(r"^\s*import\s+", re.MULTILINE)
 # ---------------------------------------------------------------------------
 # Ollama client
 # ---------------------------------------------------------------------------
+# Ollama sometimes 500s briefly while loading a cold model; retry once. (Task-009)
+_OLLAMA_LOAD_RETRY_BACKOFF = 1.5
+
+
+def _map_ollama_error(model: str, exc: Exception) -> str:
+    """Turn a known Ollama failure into a one-line, actionable message. (Task-009)
+
+    The not-set-up-correctly cases (Ollama down, model not pulled) are the most
+    common first-run failures for this server, so they get a clear fix instead of
+    a raw httpx string.
+    """
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return (
+            f"Ollama is not reachable at {OLLAMA_URL}. Is it running? "
+            "Start Ollama, or fix 'ollama_url' in model-config.json."
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
+        resp = exc.response
+        try:
+            resp.read()
+            body = resp.text
+        except Exception:
+            body = ""
+        code = resp.status_code
+        if code == 404:
+            return (
+                f"Model '{model}' is not available in Ollama (HTTP 404). "
+                f"Pull it first: ollama pull {model}"
+            )
+        return f"Ollama returned HTTP {code}: {body[:300] or exc}"
+    return f"Ollama call failed: {exc}"
+
+
+def _stream_ollama(payload: dict) -> str:
+    """One streaming request to Ollama. Raises httpx errors; caller maps them."""
+    chunks: list[str] = []
+    with httpx.stream("POST", OLLAMA_URL, json=payload, timeout=TIMEOUT) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = data.get("message", {}).get("content", "")
+            if content:
+                chunks.append(content)
+            if data.get("done", False):
+                break
+    return "".join(chunks)
+
+
 def _call_ollama_impl(
     model: str,
     messages: list[dict],
@@ -325,25 +383,22 @@ def _call_ollama_impl(
         "keep_alive": -1,
         "options": options,
     }
-    # Streaming: timeout applies per-chunk, not to the whole response.
-    # This avoids false timeouts when the model outputs a large file; as long
-    # as the model keeps producing tokens the connection stays alive.
-    chunks: list[str] = []
-    with httpx.stream("POST", OLLAMA_URL, json=payload, timeout=TIMEOUT) as resp:
-        resp.raise_for_status()
-        for line in resp.iter_lines():
-            if not line:
+    # Streaming: timeout applies per-chunk, not to the whole response (avoids
+    # false timeouts on large outputs). Connection/HTTP failures are mapped to
+    # actionable messages; a transient 500 (cold-model load) is retried once. The
+    # happy path runs the request once with no added latency. (Task-009)
+    for attempt in range(2):
+        try:
+            return _stream_ollama(payload)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 500 and attempt == 0:
+                time.sleep(_OLLAMA_LOAD_RETRY_BACKOFF)
                 continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            content = data.get("message", {}).get("content", "")
-            if content:
-                chunks.append(content)
-            if data.get("done", False):
-                break
-    return "".join(chunks)
+            raise httpx.HTTPError(_map_ollama_error(model, e)) from e
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            raise httpx.HTTPError(_map_ollama_error(model, e)) from e
+    # Unreachable: the loop either returns or raises.
+    raise httpx.HTTPError(f"Ollama call to '{model}' failed after a load retry.")
 
 
 def _call_ollama(
@@ -423,8 +478,17 @@ def _call_openrouter(
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         body = e.response.text[:400]
+        hint = ""
+        if e.response.status_code in (401, 403):
+            hint = " Check the OPENROUTER_API_KEY environment variable."
+        elif e.response.status_code == 404:
+            hint = f" Is the model slug '{model}' correct?"
         raise httpx.HTTPError(
-            f"OpenRouter returned {e.response.status_code}: {body}"
+            f"OpenRouter returned {e.response.status_code}: {body}{hint}"
+        ) from e
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        raise httpx.HTTPError(
+            f"OpenRouter is not reachable at {OPENROUTER_URL} ({e})."
         ) from e
 
     try:
@@ -589,9 +653,10 @@ public class Util {
 
 READ_SYSTEM = """\
 File analysis assistant. You receive one or more files and an analysis instruction.
-Read the files carefully and respond with your analysis as plain text.
-Do NOT output «file» blocks or code fences unless the instruction specifically
-asks for code. Focus on answering the question or performing the analysis requested.
+Answer in the fewest words that fully address the instruction. No preamble, no
+restating the question, no closing summary, no markdown headings unless asked.
+Do NOT output «file» blocks or code fences unless the instruction asks for code.
+If the answer is a list, return a plain bulleted list and nothing else.
 """
 
 # Appended to EDIT_SYSTEM only when a Java/Kotlin file is the target (Task-021).
@@ -1179,8 +1244,9 @@ def _outline_text(path: str, lf_text: str) -> str | None:
 # by summarizing each file/chunk in its own call and synthesizing the partials,
 # rather than refusing. Each partial is bounded so the synthesis stays small.
 # ---------------------------------------------------------------------------
+# Per-file/per-chunk partials are bounded tighter than the final answer; the
+# synthesis is bounded by READ_NUM_PREDICT, the same cap as a single-pass read.
 _MAPREDUCE_PARTIAL_NUM_PREDICT = 768
-_MAPREDUCE_FINAL_NUM_PREDICT = 1024
 
 
 def _read_model_call(content: str, num_predict: int | None) -> str:
@@ -1264,7 +1330,7 @@ def _read_mapreduce(files_data: list[tuple[str, str]], instruction: str) -> str:
     )
     if _check_input_size(reduce_msg, NUM_CTX, "partial summaries") is None:
         try:
-            return _read_model_call(reduce_msg, _MAPREDUCE_FINAL_NUM_PREDICT)
+            return _read_model_call(reduce_msg, READ_NUM_PREDICT)
         except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
             return f"Model call failed during reduce pass: {e}"
     # Too many partials to synthesize in one pass: return them as-is.
@@ -1321,8 +1387,9 @@ def local_outline(files: list[str]) -> str:
 def local_read(files: list[str], instruction: str) -> str:
     """Analyze files via the local model; returns analysis text, never modifies
     files. Use for summaries, review, pattern-finding. Output enters Claude's
-    context, so keep instructions focused. NOT for verbatim retrieval (use the
-    built-in Read). Call sequentially (single GPU).
+    context and is capped, so ask a focused question; a broad instruction yields
+    a broad, token-costly answer. NOT for verbatim retrieval (use the built-in
+    Read). Call sequentially (single GPU).
 
     Args:
         files: absolute paths to analyze.
@@ -1372,6 +1439,7 @@ def local_read(files: list[str], instruction: str) -> str:
             [{"role": "user", "content": user_msg}],
             system=READ_SYSTEM,
             num_ctx=NUM_CTX,
+            num_predict=READ_NUM_PREDICT,
             temperature=READ_TEMPERATURE,
         )
     except (httpx.HTTPError, IndexError, KeyError, ValueError) as e:
@@ -1667,8 +1735,9 @@ def local_snippet(prompt: str) -> str:
     prompt = _normalize_instruction(prompt)
     chosen = MODEL
     snippet_system = (
-        "Terse code/snippet generator. Output ONLY the requested code, regex, "
-        "query, or text. No prose, no explanations, no examples, no summary."
+        "Terse code/snippet generator. Output ONLY the bare artifact (the code, "
+        "regex, query, or text) and nothing else: no prose, no explanation, no "
+        "examples, no summary, no surrounding markdown fences or backticks."
     )
     full_prompt = _maybe_no_think(prompt)
     try:

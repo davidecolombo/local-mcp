@@ -68,6 +68,12 @@ Delete and rename are not local-mcp tools (they save no tokens); use the built-i
 
 **Spring/Java boilerplate** (JPA entity, Spring Data repository, ``@RestController`` + DTO, ``@Service``, ``@Configuration`` bean, mapper, test stub) from a one-line spec -> ``local_write``: the large annotated output never enters Claude's context.
 
+**Cheapest order (save the most tokens):**
+- If the result lands in a file, never let its bytes touch context: prefer the one-line-return tools (``local_edit``/``local_write``) over the text-return tools (``local_read``/``local_snippet``).
+- Fix in one call: give ``local_edit`` a diagnostic instruction ("fix the off-by-one that skips the last element") instead of ``local_read`` -> reason -> ``local_edit``. Use ``local_read`` only when you need the *answer* in context.
+- Describe intent / end-state; do not dictate line-by-line content to ``local_edit``.
+- Need a dependency's shape? ``local_outline`` it, or pass it as ``context_files`` to ``local_edit``/``local_write`` rather than ``Read``-ing it into context.
+
 **Trust tool results.** Do not re-read files to verify unless the tool returned ``REJECTED`` or ``Error``.
 $EndMarker
 "@

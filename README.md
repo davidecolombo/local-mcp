@@ -68,6 +68,36 @@ Spring is the textbook case for this server: a one-line spec expands into a larg
 
 For a multi-class change (e.g. editing a `@Service` that depends on an entity and repository), pass the collaborators as `context_files` so the model sees the types it depends on (exact method names, signatures) without Claude reading them into context and without making them editable.
 
+## Token-saving recipes
+
+The largest wins are not new features; they are using the tools in the cheapest order. The single rule behind all of them: **if the result will land in a file, never let its bytes touch Claude's context.** `local_edit` and `local_write` return a one-line summary; `local_read` and `local_snippet` return text Claude pays for. Prefer the former whenever the goal is a file change.
+
+**1. Investigate-and-fix in one call, not read-then-edit.** `local_edit` takes an *instruction*, not a diff, so it can diagnose and fix in the same call.
+
+| Costly | Cheap |
+|--------|-------|
+| `local_read("find the off-by-one in the loop")` -> read analysis into context -> reason -> `local_edit(...)` | `local_edit("fix the off-by-one that makes the loop skip the last element")` |
+
+The read step only pays off when Claude genuinely needs the *answer* in context (a decision, a summary). If the outcome is a file change, skip it.
+
+**2. Describe intent / end-state; do not dictate line-by-line.** The bytes never pass through Claude either way, so the shortest description of the desired result is cheapest.
+
+| Costly | Cheap |
+|--------|-------|
+| Read the file, compute the exact new class, paste it into `local_edit` | `local_edit("make Config a frozen dataclass and add a from_env classmethod")` |
+
+**3. Scaffold from a spec; do not write the file yourself.** A one-line spec to `local_write` expands to a large file locally (see the Spring recipes above).
+
+| Costly | Cheap |
+|--------|-------|
+| Draft a 60-line JPA entity in context, then `Write` it | `local_write("a JPA entity User with id, email, createdAt")` |
+
+**4. Outline or pass context instead of reading dependencies into context.** To get a collaborator's shape, use `local_outline` (no model call, a few hundred tokens) rather than `Read`. To let an edit see a dependency, pass it as a `context_files` entry rather than reading it into context.
+
+| Costly | Cheap |
+|--------|-------|
+| `Read(UserRepository.java)` to learn its methods, then dictate the call | `local_edit([Service.java], "add lookup(email) delegating to the repo", context_files=[UserRepository.java])` |
+
 ## Model configuration
 
 The server reads `model-config.json` at startup. If missing, built-in defaults are used. The file is gitignored.
@@ -76,8 +106,8 @@ The server reads `model-config.json` at startup. If missing, built-in defaults a
 
 | Template | Model | Provider | Notes |
 |----------|-------|----------|-------|
-| `configs/gemma4-12b.json` | `gemma4:12b` | ollama | **Default.** 7.6 GB, 256k ctx, 64k edit ctx, 180 s timeout. |
-| `configs/gemma4-e4b.json` | `gemma4:e4b` | ollama | Lightweight. 11 GB, 32k ctx, 90 s timeout. |
+| `configs/gemma4-12b.json` | `gemma4:12b` | ollama | **Default.** 7.6 GB, `num_ctx` 65536, 180 s timeout. |
+| `configs/gemma4-e4b.json` | `gemma4:e4b` | ollama | Lightweight. `num_ctx` 32768, 90 s timeout. |
 | `configs/qwen3-coder-30b.json` | `qwen3-coder:30b` | ollama | MoE 30B (~3B active). 120 s timeout. |
 | `configs/devstral-small-2-24b.json` | `devstral-small-2:24b` | ollama | Mistral code-agent model. 120 s timeout. |
 | `configs/qwen3-coder-480b-free.json` | `qwen/qwen3-coder:free` | openrouter | Remote free tier; requires `OPENROUTER_API_KEY`. |
@@ -92,14 +122,18 @@ Copy a template to `model-config.json` to switch models.
 | `provider` | `"ollama"` | `"ollama"` or `"openrouter"` |
 | `model` | `"gemma4:e4b"` | Ollama tag or OpenRouter slug |
 | `ollama_url` | `"http://localhost:11434/api/chat"` | Ollama endpoint |
-| `edit_ctx` | `32768` | Context window for edit/write/read (Ollama only) |
-| `snippet_ctx` | `4096` | Context window for snippet calls |
-| `snippet_num_predict` | `1024` | Max output tokens for snippets |
-| `translate_ctx` | `2048` | Context window for translation pre-pass |
-| `translate_num_predict` | `512` | Max output tokens for translation |
-| `timeout` | `1200` | Seconds; per-chunk for streaming Ollama, total for OpenRouter |
+| `num_ctx` | `32768` | One context window for every Ollama call. Kept constant on purpose: changing it between calls reloads the model (~5 s) and defeats `keep_alive` (Ollama only). |
+| `read_num_predict` | `1024` | Max output tokens for `local_read` (caps what flows back to Claude). |
+| `snippet_num_predict` | `1024` | Max output tokens for `local_snippet`. |
+| `translate_num_predict` | `512` | Max output tokens for the translation pre-pass. |
+| `temperature` | `0` | Sampling for edit/write/translate; `0` keeps full-file regeneration deterministic. |
+| `read_temperature` | `0.2` | Sampling for `local_read`/`local_snippet`; a little fluency for prose. |
+| `repeat_penalty` | `1.0` | `1.0` disables the penalty (code legitimately repeats tokens). |
+| `top_p` / `top_k` / `seed` / `num_gpu` | `null` | Optional; when null the model's own default applies. |
+| `timeout` | `1200` | Seconds; per-chunk for streaming Ollama, total for OpenRouter. |
+| `queue_timeout` | `300` | Seconds to wait in the single-worker queue before giving up (bounds the wait, not generation). |
 
-For OpenRouter, also set `openrouter_url`, `openrouter_referer`, `openrouter_title`, `openrouter_extra_body`, and `OPENROUTER_API_KEY` env var.
+For OpenRouter, also set `openrouter_url`, `openrouter_referer`, `openrouter_title`, `openrouter_extra_body`, and `OPENROUTER_API_KEY` env var. `num_ctx` is ignored for OpenRouter (the remote endpoint decides context).
 
 ## Guard-rails
 
@@ -129,6 +163,16 @@ If any check fails, the entire batch is rejected and no file is touched. On pars
 - CRLF line endings are detected and preserved on write.
 - Paths are matched case-insensitively and slash-agnostically.
 - Locked files produce a clean `file is locked or not writable` diagnostic.
+
+## Troubleshooting
+
+The most common first-run failures return a one-line, actionable message instead of a raw stack trace:
+
+- **Ollama not running**: `Ollama is not reachable at <url>. Is it running? Start Ollama, or fix 'ollama_url' in model-config.json.`
+- **Model not pulled**: `Model '<model>' is not available in Ollama (HTTP 404). Pull it first: ollama pull <model>`
+- **OpenRouter**: connection failures and `401/403/404` responses include the likely fix (check `OPENROUTER_API_KEY`, verify the model slug).
+
+A transient HTTP 500 while a cold model loads is retried once automatically before the error is surfaced.
 
 ## License
 

@@ -5,6 +5,7 @@
   "openrouter_referer": "https://claude.ai/code",
   "openrouter_title": "local-mcp",
   "openrouter_extra_body": {},
+  "read_num_predict": 1024,
   "snippet_num_predict": 1024,
   "translate_num_predict": 512,
   "temperature": 0,
