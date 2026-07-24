@@ -108,9 +108,11 @@ The server reads `model-config.json` at startup. If missing, built-in defaults a
 |----------|-------|----------|-------|
 | `configs/gemma4-12b.json` | `gemma4:12b` | ollama | **Default.** 7.6 GB, `num_ctx` 65536, 180 s timeout. |
 | `configs/gemma4-e4b.json` | `gemma4:e4b` | ollama | Lightweight. `num_ctx` 32768, 90 s timeout. |
+| `configs/qwen3.5-27b.json` | `qwen3.5:27b` | ollama | Dense 27B, thinking-capable (`think` forced off, `/no_think` applied). `num_ctx` 32768, 240 s timeout for stability under full-parameter compute. |
 | `configs/qwen3-coder-30b.json` | `qwen3-coder:30b` | ollama | MoE 30B (~3B active). 120 s timeout. |
 | `configs/devstral-small-2-24b.json` | `devstral-small-2:24b` | ollama | Mistral code-agent model. 120 s timeout. |
 | `configs/qwen3-coder-480b-free.json` | `qwen/qwen3-coder:free` | openrouter | Remote free tier; requires `OPENROUTER_API_KEY`. |
+| `configs/nemotron-3-ultra-550b-free.json` | `nvidia/nemotron-3-ultra-550b-a55b:free` | openrouter | Hybrid Transformer-Mamba MoE, 550B total / 55B active, 1M context (ignored, remote decides). Remote free tier; requires `OPENROUTER_API_KEY`. NVIDIA logs free-tier traffic for security/product improvement, don't send confidential data. |
 | `configs/openrouter-free.json` | `openrouter/free` | openrouter | Free-models router; non-deterministic model per call. |
 
 Copy a template to `model-config.json` to switch models.
