@@ -29,6 +29,11 @@ claude mcp add --scope user local-mcp uv run "C:/Users/user/.claude/local-mcp/se
 
 Restart Claude Code after step 2 or 3. After any change to `model-config.json`, reconnect the MCP server (`/mcp` or restart the CLI).
 
+## Troubleshooting
+
+- **`Start-Server.ps1` fails with "execution of scripts is disabled on this system"**: PowerShell's execution policy is blocking local scripts. Fix with `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`.
+- **`ModuleNotFoundError: No module named 'mcp.server.fastmcp'`**: `mcp` 2.0.0 renamed `FastMCP` to `MCPServer` and moved it to `mcp.server.mcpserver`, breaking this script's import. The dependency is pinned to `mcp[cli]>=1.0.0,<2.0.0` in `server.py` to avoid this; if the pin was removed, re-add it.
+
 ## Tools
 
 | Tool | When to use |
